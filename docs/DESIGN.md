@@ -201,7 +201,9 @@ pub trait Runner: Send + Sync {
 ```
 
 Runners register by name. `claude` is the default and shells out to
-`claude -p` with the profile policy. A `shell` runner runs a command template
+`claude -p` with the profile policy. Every launch gets `VFLT_COLLECTIVE`,
+`VFLT_AGENT`, `VFLT_PROFILE`, `VFLT_ITEM` and `VFLT_BIN` (the exact binary
+running the loop), so an agent's `vflt item ...` calls hit the same build. A `shell` runner runs a command template
 with the prompt on stdin and is used for tests. Any agent harness that can be
 launched as a process and told what to do can be a runner.
 
