@@ -1,0 +1,19 @@
+name        = "deployer"
+description = "Applies planned, reviewed, tested changes to a real environment, one step at a time, with every action logged."
+stages      = ["deploy"]
+runner      = "claude"
+
+[policy]
+permission_mode  = "auto"
+allowed_tools    = ["Read", "Grep", "Glob", "Bash(vflt *)", "Bash(git *)", "Bash(terraform *)", "Bash(aws *)", "Bash(gcloud *)", "Bash(kubectl *)", "Bash(docker *)", "Bash(gh *)"]
+disallowed_tools = ["Bash(rm -rf *)", "Bash(terraform destroy *)", "Bash(aws iam delete*)", "Bash(aws * delete-*)", "Bash(kubectl delete *)"]
+
+[policy.classifier]
+environment = ["Deploy items spell out the exact commands. The deployer runs what the spec says and nothing more."]
+allow       = ["Commands listed in the item spec.", "Read-only verification calls after each step."]
+soft_deny   = ["Any mutating command not listed in the spec.", "Retrying a failed apply without recording why it failed."]
+hard_deny   = ["Destroying resources.", "Changing IAM beyond the spec.", "Printing credential material."]
+
+[budget]
+max_turns  = 40
+wall_clock = "45m"

@@ -1,0 +1,19 @@
+name        = "planner"
+description = "Turns survey findings and intent into a sequence of small, executable items."
+stages      = ["plan"]
+runner      = "claude"
+
+[policy]
+permission_mode  = "auto"
+allowed_tools    = ["Read", "Grep", "Glob", "Bash(vflt *)", "Bash(git log *)", "Bash(git status *)", "Bash(ls *)", "Bash(find *)"]
+disallowed_tools = ["Bash(rm *)", "Bash(git push *)"]
+
+[policy.classifier]
+environment = ["Planning changes the board, not the system. Writes are limited to plan documents inside the item workspace."]
+allow       = ["Any vflt command.", "Writing markdown under the item workspace."]
+soft_deny   = ["Editing source files outside the item workspace."]
+hard_deny   = ["Running deploys or infrastructure changes.", "Deleting files outside the workspace."]
+
+[budget]
+max_turns  = 40
+wall_clock = "30m"

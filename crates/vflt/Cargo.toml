@@ -1,0 +1,29 @@
+[package]
+name = "vflt"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "vflt: a standalone fleet orchestrator for agents and humans"
+
+[[bin]]
+name = "vflt"
+path = "src/main.rs"
+
+[[bin]]
+name = "fake-agent"
+path = "src/bin/fake-agent.rs"
+
+[dependencies]
+vflt-core = { path = "../vflt-core" }
+vflt-runner = { path = "../vflt-runner" }
+anyhow.workspace = true
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+humantime.workspace = true
+is-terminal.workspace = true
+whoami.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

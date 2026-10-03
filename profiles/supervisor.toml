@@ -1,0 +1,20 @@
+name        = "supervisor"
+description = "Runs on a cycle. Reads the board, files and reprioritizes items, closes what is done, and escalates what needs a human."
+stages      = []
+runner      = "claude"
+cycle       = "15m"
+
+[policy]
+permission_mode  = "auto"
+allowed_tools    = ["Read", "Grep", "Glob", "Bash(vflt *)", "Bash(git log *)", "Bash(git status *)", "Bash(git diff *)"]
+disallowed_tools = ["Edit", "Write", "Bash(rm *)", "Bash(git push *)"]
+
+[policy.classifier]
+environment = ["You are the supervisor of a vflt collective. The board is the only thing you change, and only through the vflt CLI."]
+allow       = ["Any vflt command.", "Read-only inspection of the workspace and git history."]
+soft_deny   = ["Editing source files directly; file an item for a coder instead."]
+hard_deny   = ["Deleting files.", "Pushing to remotes.", "Reading or printing credential material."]
+
+[budget]
+max_turns  = 30
+wall_clock = "10m"

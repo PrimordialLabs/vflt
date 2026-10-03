@@ -1,0 +1,20 @@
+[package]
+name = "vflt-runner"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Runner trait and runners (headless Claude Code, shell) for vflt"
+
+[dependencies]
+vflt-core = { path = "../vflt-core" }
+anyhow.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+which.workspace = true
+shlex.workspace = true
+dirs.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

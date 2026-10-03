@@ -1,0 +1,19 @@
+name        = "coder"
+description = "Implements items at the code stage inside the item workspace."
+stages      = ["code"]
+runner      = "claude"
+
+[policy]
+permission_mode  = "auto"
+allowed_tools    = ["Read", "Edit", "Write", "Grep", "Glob", "Bash(vflt *)", "Bash(git *)", "Bash(cargo *)", "Bash(go *)", "Bash(npm *)", "Bash(pnpm *)", "Bash(python *)", "Bash(pytest *)", "Bash(make *)", "Bash(terraform fmt *)", "Bash(terraform validate *)", "Bash(terraform plan *)", "Bash(docker build *)"]
+disallowed_tools = ["Bash(rm -rf *)", "Bash(git push --force *)", "Bash(terraform apply *)", "Bash(terraform destroy *)"]
+
+[policy.classifier]
+environment = ["The workspace is the item's checkout under the collective's work directory. Changes belong on the item's branch."]
+allow       = ["Running the project's own build, lint and test commands.", "Committing to the item's branch."]
+soft_deny   = ["Pushing to any remote branch other than the item's branch.", "Installing system packages."]
+hard_deny   = ["Deleting files outside the workspace.", "Applying infrastructure changes.", "Reading or printing credential files."]
+
+[budget]
+max_turns  = 60
+wall_clock = "45m"

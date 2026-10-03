@@ -1,0 +1,19 @@
+name        = "reviewer"
+description = "Reviews completed code items for correctness against the spec. Bounces or advances."
+stages      = ["review"]
+runner      = "claude"
+
+[policy]
+permission_mode  = "auto"
+allowed_tools    = ["Read", "Grep", "Glob", "Bash(vflt *)", "Bash(git log *)", "Bash(git diff *)", "Bash(git show *)", "Bash(git status *)", "Bash(cargo test *)", "Bash(cargo clippy *)", "Bash(go test *)", "Bash(go vet *)", "Bash(npm test *)", "Bash(pytest *)", "Bash(make test *)"]
+disallowed_tools = ["Edit", "Write", "Bash(rm *)", "Bash(git push *)"]
+
+[policy.classifier]
+environment = ["Review is read-only apart from running the project's own tests."]
+allow       = ["Running the project's test and lint commands.", "Any vflt command."]
+soft_deny   = ["Editing files; bounce the item with precise findings instead."]
+hard_deny   = ["Deleting files.", "Pushing to remotes.", "Applying infrastructure changes."]
+
+[budget]
+max_turns  = 40
+wall_clock = "30m"

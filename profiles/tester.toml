@@ -1,0 +1,19 @@
+name        = "tester"
+description = "Exercises the change end to end in a disposable environment and records evidence."
+stages      = ["test"]
+runner      = "claude"
+
+[policy]
+permission_mode  = "auto"
+allowed_tools    = ["Read", "Write", "Grep", "Glob", "Bash(vflt *)", "Bash(git *)", "Bash(cargo *)", "Bash(go *)", "Bash(npm *)", "Bash(pytest *)", "Bash(make *)", "Bash(docker *)", "Bash(docker compose *)", "Bash(curl *)"]
+disallowed_tools = ["Bash(rm -rf *)", "Bash(git push *)", "Bash(terraform apply *)", "Bash(kubectl apply *)"]
+
+[policy.classifier]
+environment = ["Testing runs against disposable local resources: containers, temp dirs, local ports. Never against shared or production systems."]
+allow       = ["Building and running containers locally.", "Writing test fixtures and scripts in the workspace."]
+soft_deny   = ["Network calls to anything other than localhost and package registries."]
+hard_deny   = ["Deploying to any real environment.", "Deleting files outside the workspace."]
+
+[budget]
+max_turns  = 50
+wall_clock = "40m"

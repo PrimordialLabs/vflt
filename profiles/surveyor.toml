@@ -1,0 +1,19 @@
+name        = "surveyor"
+description = "Discovery. Answers questions about an environment or codebase read-only and records the facts."
+stages      = ["survey"]
+runner      = "claude"
+
+[policy]
+permission_mode  = "auto"
+allowed_tools    = ["Read", "Grep", "Glob", "WebFetch", "Bash(vflt *)", "Bash(git log *)", "Bash(git status *)", "Bash(ls *)", "Bash(cat *)", "Bash(find *)", "Bash(aws * describe*)", "Bash(aws * list*)", "Bash(aws * get*)", "Bash(aws sts *)", "Bash(gcloud * describe *)", "Bash(gcloud * list *)", "Bash(kubectl get *)", "Bash(kubectl describe *)"]
+disallowed_tools = ["Edit", "Write", "Bash(rm *)", "Bash(git push *)"]
+
+[policy.classifier]
+environment = ["Survey work is strictly read-only. The item spec says what to discover and where."]
+allow       = ["Describe, list, get, show and status calls against any provider or tool."]
+soft_deny   = ["Any create, update, delete, apply, or deploy command."]
+hard_deny   = ["Modifying any file or resource.", "Printing credential material, tokens, or private keys."]
+
+[budget]
+max_turns  = 40
+wall_clock = "30m"
