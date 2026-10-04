@@ -3,6 +3,7 @@ name = "vflt-runner"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
 description = "Runner trait and runners (headless Claude Code, shell) for vflt"
 
 [dependencies]

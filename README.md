@@ -192,3 +192,7 @@ cargo clippy --all-targets
 The end-to-end tests drive the real `vflt` binary with `fake-agent`, a small
 Rust fixture that behaves like an agent (complete, bounce, block, raise,
 hang, do nothing). No shell scripts, so the suite runs unchanged on Windows.
+
+## License
+
+Apache-2.0. See [LICENSE](LICENSE).

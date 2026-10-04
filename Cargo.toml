@@ -5,8 +5,8 @@ members = ["crates/vflt-core", "crates/vflt-runner", "crates/vflt"]
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-license = "MIT"
-repository = "https://github.com/vmantese/vflt"
+license = "Apache-2.0"
+repository = "https://github.com/primordiallabs/vflt"
 
 [workspace.dependencies]
 anyhow = "1"

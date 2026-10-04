@@ -3,6 +3,7 @@ name = "vflt-core"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
 description = "Core types, Store trait and file store for the vflt fleet orchestrator"
 
 [dependencies]

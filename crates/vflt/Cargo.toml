@@ -3,6 +3,7 @@ name = "vflt"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
 description = "vflt: a standalone fleet orchestrator for agents and humans"
 
 [[bin]]
