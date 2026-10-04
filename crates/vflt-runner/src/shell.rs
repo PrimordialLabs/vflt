@@ -22,8 +22,16 @@ impl ShellRunner {
         }
     }
 
+    /// Split the command template into argv without invoking a shell. POSIX
+    /// shell-style on Unix; on Windows, whitespace-separated with double or
+    /// single quotes and no backslash escapes, so `C:\path\agent.exe` survives.
     pub fn argv(&self) -> Result<Vec<String>> {
-        let argv = shlex::split(&self.command).with_context(|| {
+        let split = if cfg!(windows) {
+            split_windows(&self.command)
+        } else {
+            shlex::split(&self.command)
+        };
+        let argv = split.with_context(|| {
             format!(
                 "runner {}: cannot parse command template {:?}",
                 self.name, self.command
@@ -34,6 +42,42 @@ impl ShellRunner {
         }
         Ok(argv)
     }
+}
+
+/// Windows template splitter: whitespace separates arguments, a run opened
+/// with `"` or `'` closes only on the same character, and backslashes are
+/// ordinary characters. Returns `None` on an unbalanced quote.
+fn split_windows(s: &str) -> Option<Vec<String>> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut quote: Option<char> = None;
+    let mut had = false;
+    for c in s.chars() {
+        match (c, quote) {
+            (q, Some(open)) if q == open => quote = None,
+            ('"' | '\'', None) => {
+                quote = Some(c);
+                had = true;
+            }
+            (c, None) if c.is_whitespace() => {
+                if had {
+                    out.push(std::mem::take(&mut cur));
+                    had = false;
+                }
+            }
+            (c, _) => {
+                cur.push(c);
+                had = true;
+            }
+        }
+    }
+    if quote.is_some() {
+        return None;
+    }
+    if had {
+        out.push(cur);
+    }
+    Some(out)
 }
 
 impl Runner for ShellRunner {
@@ -142,6 +186,20 @@ mod tests {
             vec!["my-agent", "--flag", "two words", "plain"]
         );
         assert!(ShellRunner::new("x", "").argv().is_err());
+    }
+
+    #[test]
+    fn windows_splitter_keeps_backslashes_and_both_quote_styles() {
+        assert_eq!(
+            split_windows(r#"C:\p\agent.exe "my agent.py" --flag 'x y'"#).unwrap(),
+            vec![r"C:\p\agent.exe", "my agent.py", "--flag", "x y"]
+        );
+        assert_eq!(
+            split_windows(r#"a "it's" 'say "hi"'"#).unwrap(),
+            vec!["a", "it's", r#"say "hi""#]
+        );
+        assert!(split_windows("unbalanced 'quote").is_none());
+        assert_eq!(split_windows(r#""""#).unwrap(), vec![""]);
     }
 
     #[test]

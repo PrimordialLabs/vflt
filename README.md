@@ -13,12 +13,21 @@ Design: [docs/DESIGN.md](docs/DESIGN.md).
 
 ## Install
 
+Straight from GitHub, no clone needed:
+
+```sh
+cargo install --git https://github.com/primordiallabs/vflt vflt
+```
+
+Or from a checkout of this repo:
+
 ```sh
 cargo install --path crates/vflt
 ```
 
-Requires Rust 1.85+ and, for the default git-tracked store, `git` on PATH.
-Builds and tests on macOS, Linux and Windows.
+Either way the `vflt` binary lands in `~/.cargo/bin`. Requires Rust 1.85+
+and, for the default git-tracked store, `git` on PATH. Builds and tests on
+macOS, Linux and Windows.
 
 ## Quickstart
 
