@@ -25,3 +25,10 @@ pub use selection::{select_batch, select_next, Picking};
 pub use sqlite_store::SqliteStore;
 pub use store::{init_store, open_store, Store};
 pub use types::*;
+
+/// Write one line to stderr, ignoring failure. A long-running orchestrator
+/// must never die because its log pipe closed (`eprintln!` panics then).
+pub fn log_line(line: &str) {
+    use std::io::Write;
+    let _ = writeln!(std::io::stderr().lock(), "{line}");
+}

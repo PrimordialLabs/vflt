@@ -239,7 +239,7 @@ impl SqliteStore {
         });
         match res.and_then(|text| crate::mirror::write(&crate::mirror::path_for(dir, id), &text)) {
             Ok(()) => {}
-            Err(e) => eprintln!("vflt: warning: mirror of {id} not written: {e}"),
+            Err(e) => crate::log_line(&format!("vflt: warning: mirror of {id} not written: {e}")),
         }
     }
 

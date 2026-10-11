@@ -55,7 +55,7 @@ impl Agentry<'_> {
     }
 
     fn log(&self, msg: impl AsRef<str>) {
-        eprintln!("vflt{}: {}", self.opts.prefix, msg.as_ref());
+        vflt_core::log_line(&format!("vflt{}: {}", self.opts.prefix, msg.as_ref()));
     }
 
     /// Update the runtime record, keeping what the closure does not touch.

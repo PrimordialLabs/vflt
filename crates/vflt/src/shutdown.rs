@@ -15,17 +15,19 @@ pub fn install() -> Arc<AtomicBool> {
         let n = count.fetch_add(1, Ordering::SeqCst);
         flag.store(true, Ordering::SeqCst);
         if n == 0 {
-            eprintln!(
-                "vflt: finishing the current turn(s), then exiting; interrupt again to abort them"
+            vflt_core::log_line(
+                "vflt: finishing the current turn(s), then exiting; interrupt again to abort them",
             );
         } else {
-            eprintln!("vflt: aborting running turns");
+            vflt_core::log_line("vflt: aborting running turns");
             vflt_runner::process::abort_children();
             std::process::exit(130);
         }
     });
     if let Err(e) = result {
-        eprintln!("vflt: warning: interrupts will not be graceful: {e}");
+        vflt_core::log_line(&format!(
+            "vflt: warning: interrupts will not be graceful: {e}"
+        ));
     }
     stop
 }

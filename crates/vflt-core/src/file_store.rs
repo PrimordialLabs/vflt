@@ -258,7 +258,7 @@ impl FileStore {
     fn commit(&self, paths: &[PathBuf], message: &str) {
         if let Some(repo) = &self.git_repo {
             if let Err(e) = git::commit(repo, paths, message) {
-                eprintln!("vflt: warning: git commit skipped: {e}");
+                crate::log_line(&format!("vflt: warning: git commit skipped: {e}"));
             }
         }
     }

@@ -27,11 +27,11 @@ pub fn run(ctx: &Ctx, only: Vec<String>, interval: Duration, once: bool) -> Resu
         );
     }
     let width = agents.iter().map(|n| n.len()).max().unwrap_or(0);
-    eprintln!(
+    vflt_core::log_line(&format!(
         "vflt: fleet of {} agents: {}",
         agents.len(),
         agents.join(", ")
-    );
+    ));
     let stop = crate::shutdown::install();
     let failures: Vec<(String, anyhow::Error)> = std::thread::scope(|s| {
         let handles: Vec<_> = agents
@@ -66,7 +66,7 @@ pub fn run(ctx: &Ctx, only: Vec<String>, interval: Duration, once: bool) -> Resu
             .collect()
     });
     for (name, e) in &failures {
-        eprintln!("vflt: agent {name} exited with an error: {e:#}");
+        vflt_core::log_line(&format!("vflt: agent {name} exited with an error: {e:#}"));
     }
     if failures.len() == agents.len() {
         bail!("every agent failed");

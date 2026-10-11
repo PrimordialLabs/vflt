@@ -15,7 +15,7 @@ use clap::Parser;
 fn main() {
     let args = cli::Cli::parse();
     if let Err(e) = cmd::dispatch(args) {
-        eprintln!("vflt: {e:#}");
+        vflt_core::log_line(&format!("vflt: {e:#}"));
         std::process::exit(1);
     }
 }
