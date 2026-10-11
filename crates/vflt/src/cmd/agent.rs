@@ -283,6 +283,9 @@ fn set_desired(ctx: &Ctx, names: Vec<String>, all: bool, desired: Desired) -> Re
 pub struct Queue {
     /// Pending, claimable now (dependencies done).
     pub ready: usize,
+    /// Pending with dependencies done, but filed by the agent itself while it
+    /// is on hold, so it will not take them until the hold lifts.
+    pub held: usize,
     /// Pending but waiting on other items.
     pub waiting: usize,
     /// Came back by a bounce.
@@ -314,10 +317,12 @@ pub fn queue_for(agent: &Agent, items: &[Item]) -> Queue {
         }
         match i.status {
             Status::Pending => {
-                if i.deps.iter().all(|d| closed.contains(d)) {
-                    q.ready += 1;
-                } else {
+                if !i.deps.iter().all(|d| closed.contains(d)) {
                     q.waiting += 1;
+                } else if agent.config.hold && names.contains(&i.owner.as_str()) {
+                    q.held += 1;
+                } else {
+                    q.ready += 1;
                 }
                 if i.returned {
                     q.returned += 1;
@@ -384,6 +389,11 @@ pub fn reading(
                     .unwrap_or_default();
                 if agent.runtime.snoozed.is_some() {
                     ("idle", "snoozed until work is routed here".into())
+                } else if agent.config.hold && q.held > 0 {
+                    (
+                        "idle",
+                        format!("hold: routed work only; {} self-filed waiting", q.held),
+                    )
                 } else if agent.config.hold {
                     ("idle", "hold: routed work only".into())
                 } else if cycle.trim().is_empty() {

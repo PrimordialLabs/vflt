@@ -553,6 +553,9 @@ fn control_plane_pause_hold_wake_snooze_and_overrides() {
 
     // hold: routed work only, self-filed work waits
     c.ok(&["agent", "hold", "w", "on"]);
+    let list = c.json(&["agent", "list"]);
+    assert_eq!(list[0]["queue"]["ready"], 1);
+    assert_eq!(list[0]["queue"]["held"], 1);
     ok(&c.run_agent("w", "lane", "complete", &[]));
     assert_eq!(c.show(&routed)["status"], "done");
     ok(&c.run_agent("w", "lane", "complete", &[]));
@@ -561,6 +564,9 @@ fn control_plane_pause_hold_wake_snooze_and_overrides() {
         "pending",
         "held agents leave self-filed work"
     );
+    let list = c.json(&["agent", "list"]);
+    assert_eq!(list[0]["queue"]["ready"], 0);
+    assert_eq!(list[0]["queue"]["held"], 1);
     c.ok(&["agent", "hold", "w", "off"]);
 
     // model override reaches the runner
