@@ -116,8 +116,8 @@ leaves draft its spec is immutable; everything learned goes in notes.
 **Raising** asks a human for a `decision` (a call to make) or an `action`
 (something only a person can do). `vflt inbox` lists them, plus what looks
 stuck: stale claims, items assigned to no one who can take them, chains
-waiting on blocked items, long blocks, old drafts, and backlogs behind paused
-or idle agents. `vflt item respond <id> --note "..."` answers: the note lands,
+waiting on blocked items, long blocks, old drafts, work handed to a person
+and never raised, and backlogs behind paused or idle agents. `vflt item respond <id> --note "..."` answers: the note lands,
 a raised or blocked item reopens for its assignee, and an item resting with
 the responder goes back to its owner.
 

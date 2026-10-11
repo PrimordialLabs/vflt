@@ -467,6 +467,11 @@ fn inbox(ctx: &Ctx, kind: &str) -> Result<()> {
     let mut attention: Vec<Attention> = Vec::new();
     let by_id: std::collections::HashMap<&vflt_core::ItemId, &Item> =
         all.iter().map(|i| (i.id(), i)).collect();
+    let humans: std::collections::HashSet<&str> = agents
+        .iter()
+        .filter(|a| a.config.kind == AgentKind::Human)
+        .map(|a| a.id().as_str())
+        .collect();
     let mut names: std::collections::HashSet<String> =
         agents.iter().map(|a| a.id().to_string()).collect();
     names.extend(profiles.iter().map(|p| p.name.clone()));
@@ -526,6 +531,22 @@ fn inbox(ctx: &Ctx, kind: &str) -> Result<()> {
                             i.assignee.as_ref().map(|a| a.as_str()).unwrap_or("the pool")
                         ),
                     });
+                }
+                // Work resting with a person, not raised: nobody else will
+                // pick it up, and nothing about it says it is waiting.
+                if let Some(a) = i.assignee.as_ref().filter(|a| humans.contains(a.as_str())) {
+                    if now - i.updated > chrono::Duration::hours(24) && i.owner != *a {
+                        attention.push(Attention {
+                            kind: "with_person",
+                            item: Some(i.id().to_string()),
+                            agent: Some(a.to_string()),
+                            summary: format!(
+                                "pending with {a} for {} without being raised: {}",
+                                util::age(i.updated),
+                                util::truncate(&i.title, 80)
+                            ),
+                        });
+                    }
                 }
                 let stuck: Vec<String> = i
                     .deps

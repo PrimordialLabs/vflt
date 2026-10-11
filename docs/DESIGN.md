@@ -340,7 +340,8 @@ vflt cost [--since 7d] [--by agent|day|item]
 Attention kinds: `stale_claim`, `stranded` (assigned to nobody who can take
 it), `stalled_chain` (waiting on a blocked or raised item), `long_blocked`,
 `stale_draft`, `paused_backlog` (ready work behind a paused or stopped agent),
-`idle_backlog` (ready work for an agent that is not running).
+`idle_backlog` (ready work for an agent that is not running), `with_person`
+(pending work handed to a person a day ago and never raised).
 
 ## 10. Collectives and lending
 

@@ -37,19 +37,27 @@ pub fn parse_since(s: &str) -> Result<DateTime<Utc>> {
 }
 
 pub fn age(since: DateTime<Utc>) -> String {
-    let secs = (Utc::now() - since).num_seconds().max(0) as u64;
-    humantime::format_duration(std::time::Duration::from_secs(round_age(secs))).to_string()
+    compact((Utc::now() - since).num_seconds().max(0) as u64)
 }
 
-fn round_age(secs: u64) -> u64 {
-    if secs < 60 {
-        secs
-    } else if secs < 3600 {
-        secs - secs % 60
-    } else if secs < 86400 {
-        secs - secs % 3600
-    } else {
-        secs - secs % 86400
+/// One unit, rounded down: "45s", "12m", "5h", "18d".
+fn compact(secs: u64) -> String {
+    match secs {
+        s if s < 60 => format!("{s}s"),
+        s if s < 3600 => format!("{}m", s / 60),
+        s if s < 86_400 => format!("{}h", s / 3600),
+        s => format!("{}d", s / 86_400),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn ages_are_compact() {
+        assert_eq!(super::compact(5), "5s");
+        assert_eq!(super::compact(125), "2m");
+        assert_eq!(super::compact(7_300), "2h");
+        assert_eq!(super::compact(70 * 86_400 + 9_000), "70d");
     }
 }
 
