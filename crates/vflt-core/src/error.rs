@@ -26,7 +26,7 @@ pub enum Error {
         verb: &'static str,
         from: String,
     },
-    #[error("store kind `{0}` is not implemented yet; only `file` is available in this release")]
+    #[error("store kind `{0}` is not implemented yet; `file` and `sqlite` are available in this release")]
     StoreNotImplemented(String),
     #[error("no collective found: looked for collective.toml in {0} and its ancestors, then ./.vflt; pass --collective or set VFLT_COLLECTIVE")]
     CollectiveNotFound(PathBuf),

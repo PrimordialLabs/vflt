@@ -4,6 +4,7 @@ mod agent_loop;
 mod cli;
 mod cmd;
 mod ctx;
+mod fleet;
 mod identity;
 mod prompt;
 mod util;

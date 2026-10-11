@@ -1,15 +1,31 @@
 //! Locating the collective root.
 //!
-//! Order: explicit path, `VFLT_COLLECTIVE`, nearest ancestor of the cwd that
-//! holds `collective.toml` (directly or under `.vflt/`), then `./.vflt`.
+//! Order: explicit path, `VFLT_COLLECTIVE`, then the nearest ancestor of the
+//! cwd that holds `collective.toml` directly, holds it under `.vflt/`, or has
+//! a `.vflt` *file* pointing elsewhere, then `./.vflt`.
+//!
+//! The pointer file lets a repository keep its collective in a subdirectory
+//! (or a submodule) and still be found from anywhere inside the repository:
+//!
+//! ```toml
+//! # .vflt
+//! path = "ops/fleet"
+//! ```
 
 use std::path::{Path, PathBuf};
+
+use serde::Deserialize;
 
 use crate::error::{Error, Result};
 
 pub const CONFIG_FILE: &str = "collective.toml";
 pub const DEFAULT_DIR: &str = ".vflt";
 pub const ENV_VAR: &str = "VFLT_COLLECTIVE";
+
+#[derive(Deserialize)]
+struct Pointer {
+    path: String,
+}
 
 pub fn find(explicit: Option<&Path>, cwd: &Path) -> Result<PathBuf> {
     if let Some(p) = explicit {
@@ -26,19 +42,16 @@ pub fn find(explicit: Option<&Path>, cwd: &Path) -> Result<PathBuf> {
 pub fn find_from(start: &Path) -> Option<PathBuf> {
     let mut dir = Some(start);
     while let Some(d) = dir {
-        if d.join(CONFIG_FILE).is_file() {
-            return Some(d.to_path_buf());
-        }
-        let nested = d.join(DEFAULT_DIR);
-        if nested.join(CONFIG_FILE).is_file() {
-            return Some(nested);
+        if let Some(found) = check(d) {
+            return Some(found);
         }
         dir = d.parent();
     }
     None
 }
 
-/// Accept either the collective root or a directory that contains `.vflt/`.
+/// Accept the collective root, a directory that contains `.vflt/`, or a
+/// directory with a `.vflt` pointer file.
 fn check(p: &Path) -> Option<PathBuf> {
     if p.join(CONFIG_FILE).is_file() {
         return Some(p.to_path_buf());
@@ -46,6 +59,14 @@ fn check(p: &Path) -> Option<PathBuf> {
     let nested = p.join(DEFAULT_DIR);
     if nested.join(CONFIG_FILE).is_file() {
         return Some(nested);
+    }
+    if nested.is_file() {
+        let text = std::fs::read_to_string(&nested).ok()?;
+        let ptr: Pointer = toml::from_str(&text).ok()?;
+        let target = p.join(ptr.path.trim());
+        if target.join(CONFIG_FILE).is_file() {
+            return Some(target);
+        }
     }
     None
 }
@@ -68,5 +89,20 @@ mod tests {
         assert_eq!(check(&root).unwrap(), coll);
         assert_eq!(check(&coll).unwrap(), coll);
         assert!(find_from(tmp.path()).is_none());
+    }
+
+    #[test]
+    fn follows_a_pointer_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        let target = repo.join("ops/fleet");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::create_dir_all(repo.join("src/deep")).unwrap();
+        std::fs::write(target.join(CONFIG_FILE), "").unwrap();
+        std::fs::write(repo.join(DEFAULT_DIR), "path = \"ops/fleet\"\n").unwrap();
+        assert_eq!(find_from(&repo.join("src/deep")).unwrap(), target);
+        // a broken pointer is not a collective
+        std::fs::write(repo.join(DEFAULT_DIR), "path = \"nowhere\"\n").unwrap();
+        assert!(find_from(&repo.join("src/deep")).is_none());
     }
 }

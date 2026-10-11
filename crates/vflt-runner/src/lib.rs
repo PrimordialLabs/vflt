@@ -37,8 +37,13 @@ pub struct RunRequest {
     /// The turn's instruction (item spec, notes, context).
     pub prompt: String,
     pub cwd: PathBuf,
+    /// Private scratch space for the turn (prompt files and the like). Never
+    /// the workspace itself, which may be shared with other agents.
+    pub scratch_dir: PathBuf,
     /// Directories the runner may touch beyond `cwd`.
     pub extra_dirs: Vec<PathBuf>,
+    /// Model to run, when the runner can choose one.
+    pub model: Option<String>,
     pub policy: Policy,
     pub budget: Budget,
     /// Environment variables for the child (VFLT_ITEM, VFLT_COLLECTIVE, ...).

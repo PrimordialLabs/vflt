@@ -26,8 +26,6 @@ pub const DEFAULT_PROFILES: &[DefaultProfile] = &[
     profile!("deployer"),
 ];
 
-pub const GITIGNORE: &str = "# vflt: machine-local liveness state and per-item workspaces are not part of the board\nwork/\nagents/*.hb\nitems/*/.claim\n";
-
 #[cfg(test)]
 mod tests {
     use super::*;

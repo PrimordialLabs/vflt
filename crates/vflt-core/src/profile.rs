@@ -1,6 +1,12 @@
 //! Profiles: a role an agent plays. `profiles/<name>.toml` plus
 //! `profiles/<name>.md` (the system prompt).
+//!
+//! A prompt may pull in shared text with a line of the form
+//! `#include <path>`, the path relative to the collective root. Includes
+//! nest, and are expanded every time the profile loads, so editing a shared
+//! fragment changes every agent's next turn.
 
+use std::collections::BTreeMap;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
@@ -92,12 +98,15 @@ pub struct Policy {
     pub classifier: Classifier,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Budget {
     #[serde(default = "default_max_turns")]
     pub max_turns: u32,
     #[serde(default = "default_wall_clock")]
     pub wall_clock: String,
+    /// Spend cap per UTC day, in USD, for each agent running this profile.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub daily_usd: Option<f64>,
 }
 
 fn default_max_turns() -> u32 {
@@ -113,6 +122,7 @@ impl Default for Budget {
         Budget {
             max_turns: default_max_turns(),
             wall_clock: default_wall_clock(),
+            daily_usd: None,
         }
     }
 }
@@ -123,7 +133,58 @@ impl Budget {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Where a turn runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceMode {
+    /// A private directory per item under the collective's work dir.
+    #[default]
+    Item,
+    /// `dir` itself, shared by every item and agent (an existing checkout).
+    Shared,
+    /// A git worktree of `dir` per item, on branch `vflt/<item>`.
+    Worktree,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct Workspace {
+    #[serde(default)]
+    pub mode: WorkspaceMode,
+    /// For `shared` and `worktree`: the directory, relative to the collective
+    /// root or absolute.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub dir: String,
+    /// More directories the runner may touch, resolved the same way.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub add_dirs: Vec<String>,
+}
+
+/// Commands run around the agent's work. Each is a command template split
+/// shlex-style and spawned directly, with the `VFLT_*` environment set.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct Hooks {
+    /// Before claiming anything. A non-zero exit holds the agent (status
+    /// `gated`, the first output line as its note) until a later check passes.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub gate: Vec<String>,
+    /// In the workspace, after the claim and before the runner. A non-zero
+    /// exit releases the turn's items back to pending and holds the agent
+    /// like a failed gate.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub before: Vec<String>,
+    /// In the workspace, after the runner exits. A non-zero exit adds the
+    /// output to every item of the turn as a note.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub after: Vec<String>,
+}
+
+impl Hooks {
+    pub fn is_empty(&self) -> bool {
+        self.gate.is_empty() && self.before.is_empty() && self.after.is_empty()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Profile {
     pub name: String,
     #[serde(default)]
@@ -136,20 +197,71 @@ pub struct Profile {
     /// Command template for `shell`-style runners. Ignored by `claude`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runner_command: Option<String>,
-    /// Empty: wake on work. "15m": run every 15 minutes regardless of items.
+    /// Model for the runner (claude: `--model`). Empty: the runner's default.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub model: String,
+    /// Empty: wake on work only. "15m": also run a cycle turn every 15
+    /// minutes when no item is claimable (every 15 minutes regardless for a
+    /// profile with no stages).
     #[serde(default)]
     pub cycle: String,
+    /// Claim up to this many items into one turn.
+    #[serde(default = "default_batch")]
+    pub batch: u32,
     #[serde(default)]
     pub policy: Policy,
     #[serde(default)]
     pub budget: Budget,
-    /// System prompt, from `<name>.md`. Not part of the toml.
+    #[serde(default)]
+    pub workspace: Workspace,
+    #[serde(default)]
+    pub hooks: Hooks,
+    /// Extra environment for runners and hooks.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub env: BTreeMap<String, String>,
+    /// System prompt, from `<name>.md` with includes expanded. Not part of the
+    /// toml.
     #[serde(skip)]
     pub prompt: String,
 }
 
 fn default_runner() -> String {
     "claude".to_string()
+}
+
+fn default_batch() -> u32 {
+    1
+}
+
+const MAX_INCLUDE_DEPTH: usize = 16;
+
+/// Expand `#include <path>` lines, paths relative to `base`.
+pub fn expand_includes(text: &str, base: &Path) -> Result<String> {
+    fn go(text: &str, base: &Path, depth: usize, out: &mut String) -> Result<()> {
+        if depth > MAX_INCLUDE_DEPTH {
+            return Err(Error::invalid(
+                "profile",
+                "#include nesting too deep (a cycle?)",
+            ));
+        }
+        for line in text.split_inclusive('\n') {
+            let trimmed = line.trim_end_matches(['\n', '\r']);
+            if let Some(rest) = trimmed.strip_prefix("#include ") {
+                let path = base.join(rest.trim());
+                let inner = std::fs::read_to_string(&path).map_err(|e| Error::io(&path, e))?;
+                go(&inner.replace("\r\n", "\n"), base, depth + 1, out)?;
+                if !out.ends_with('\n') {
+                    out.push('\n');
+                }
+            } else {
+                out.push_str(line);
+            }
+        }
+        Ok(())
+    }
+    let mut out = String::with_capacity(text.len());
+    go(text, base, 0, &mut out)?;
+    Ok(out)
 }
 
 impl Profile {
@@ -160,8 +272,9 @@ impl Profile {
         Ok(p)
     }
 
-    /// Load `<dir>/<name>.toml` and `<dir>/<name>.md`.
-    pub fn load(dir: &Path, name: &str) -> Result<Self> {
+    /// Load `<dir>/<name>.toml` and `<dir>/<name>.md`, expanding includes
+    /// relative to `base` (the collective root).
+    pub fn load(dir: &Path, name: &str, base: &Path) -> Result<Self> {
         let toml_path = dir.join(format!("{name}.toml"));
         let md_path = dir.join(format!("{name}.md"));
         if !toml_path.exists() {
@@ -170,11 +283,11 @@ impl Profile {
         let toml_text =
             std::fs::read_to_string(&toml_path).map_err(|e| Error::io(&toml_path, e))?;
         let prompt = match std::fs::read_to_string(&md_path) {
-            Ok(s) => s,
+            Ok(s) => expand_includes(&s, base)?,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
             Err(e) => return Err(Error::io(&md_path, e)),
         };
-        let mut p = Profile::parse(&toml_text, &prompt)?;
+        let p = Profile::parse(&toml_text, &prompt)?;
         if p.name != name {
             return Err(Error::invalid(
                 "profile",
@@ -185,11 +298,10 @@ impl Profile {
                 ),
             ));
         }
-        p.prompt = prompt;
         Ok(p)
     }
 
-    pub fn load_all(dir: &Path) -> Result<Vec<Self>> {
+    pub fn load_all(dir: &Path, base: &Path) -> Result<Vec<Self>> {
         let mut out = Vec::new();
         let rd = match std::fs::read_dir(dir) {
             Ok(rd) => rd,
@@ -209,7 +321,7 @@ impl Profile {
             .collect();
         names.sort();
         for n in names {
-            out.push(Profile::load(dir, &n)?);
+            out.push(Profile::load(dir, &n, base)?);
         }
         Ok(out)
     }
@@ -226,6 +338,21 @@ impl Profile {
                 format!(
                     "{} has no stages and no cycle; it would never run",
                     self.name
+                ),
+            ));
+        }
+        if self.batch == 0 {
+            return Err(Error::invalid(
+                "profile",
+                format!("{}: batch must be at least 1", self.name),
+            ));
+        }
+        if self.workspace.mode != WorkspaceMode::Item && self.workspace.dir.trim().is_empty() {
+            return Err(Error::invalid(
+                "profile",
+                format!(
+                    "{}: workspace mode {:?} needs a workspace.dir",
+                    self.name, self.workspace.mode
                 ),
             ));
         }
@@ -264,6 +391,9 @@ stages = ["code"]
         assert_eq!(p.policy.permission_mode, PermissionMode::Auto);
         assert!(p.cycle().is_none());
         assert!(p.handles(&Stage::new("code")));
+        assert_eq!(p.batch, 1);
+        assert_eq!(p.workspace.mode, WorkspaceMode::Item);
+        assert!(p.hooks.is_empty());
     }
 
     #[test]
@@ -271,6 +401,36 @@ stages = ["code"]
         assert!(Profile::parse("name = \"x\"\n", "").is_err());
         let p = Profile::parse("name = \"x\"\ncycle = \"15m\"\n", "").unwrap();
         assert!(p.is_cycle_only());
+        let hybrid =
+            Profile::parse("name = \"x\"\nstages = [\"code\"]\ncycle = \"2h\"\n", "").unwrap();
+        assert!(!hybrid.is_cycle_only());
+        assert!(hybrid.cycle().is_some());
+    }
+
+    #[test]
+    fn shared_workspace_needs_a_dir() {
+        let bad = "name = \"x\"\nstages = [\"code\"]\n[workspace]\nmode = \"shared\"\n";
+        assert!(Profile::parse(bad, "").is_err());
+        let ok = "name = \"x\"\nstages = [\"code\"]\nbatch = 3\nmodel = \"m\"\n[workspace]\nmode = \"shared\"\ndir = \"..\"\nadd_dirs = [\"../other\"]\n[hooks]\ngate = [\"check-disk\"]\n[env]\nA = \"1\"\n";
+        let p = Profile::parse(ok, "").unwrap();
+        assert_eq!(p.workspace.dir, "..");
+        assert_eq!(p.batch, 3);
+        assert_eq!(p.model, "m");
+        assert_eq!(p.hooks.gate, vec!["check-disk".to_string()]);
+        assert_eq!(p.env.get("A").map(String::as_str), Some("1"));
+    }
+
+    #[test]
+    fn includes_expand_recursively_and_fail_loudly() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("frag")).unwrap();
+        std::fs::write(tmp.path().join("frag/a.md"), "A1\n#include frag/b.md\nA2").unwrap();
+        std::fs::write(tmp.path().join("frag/b.md"), "B\n").unwrap();
+        let out = expand_includes("top\n#include frag/a.md\nend\n", tmp.path()).unwrap();
+        assert_eq!(out, "top\nA1\nB\nA2\nend\n");
+        assert!(expand_includes("#include nope.md\n", tmp.path()).is_err());
+        std::fs::write(tmp.path().join("frag/loop.md"), "#include frag/loop.md\n").unwrap();
+        assert!(expand_includes("#include frag/loop.md\n", tmp.path()).is_err());
     }
 
     #[test]

@@ -4,13 +4,13 @@ use std::path::PathBuf;
 
 use anyhow::{anyhow, Context, Result};
 use serde::Serialize;
-use vflt_core::{discover, ActorId, FileStore, Item, ItemId, Store};
+use vflt_core::{discover, ActorId, Item, ItemId, Store};
 
 use crate::identity;
 
 pub struct Ctx {
     pub root: PathBuf,
-    pub store: FileStore,
+    pub store: Box<dyn Store>,
     pub actor: ActorId,
     pub json: bool,
 }
@@ -19,9 +19,8 @@ impl Ctx {
     pub fn open(collective: Option<&PathBuf>, actor: Option<&str>, json: bool) -> Result<Self> {
         let cwd = std::env::current_dir().context("current dir")?;
         let root = discover::find(collective.map(|p| p.as_path()), &cwd)?;
-        // open_store validates the kind; we need the concrete FileStore for paths.
-        let _ = vflt_core::open_store(&root)?;
-        let store = FileStore::open(&root)?;
+        let root = std::fs::canonicalize(&root).unwrap_or(root);
+        let store = vflt_core::open_store(&root)?;
         Ok(Ctx {
             root,
             store,
@@ -31,11 +30,12 @@ impl Ctx {
     }
 
     pub fn store(&self) -> &dyn Store {
-        &self.store
+        self.store.as_ref()
     }
 
-    /// Exact id, or a unique prefix of one.
+    /// Exact id, a bare number for a sequential id, or a unique prefix.
     pub fn resolve_id(&self, id: &str) -> Result<ItemId> {
+        let id = id.trim();
         let exact = ItemId::from(id);
         if self.store.get_item(&exact).is_ok() {
             return Ok(exact);
@@ -45,6 +45,10 @@ impl Ctx {
         } else {
             format!("vf-{id}")
         };
+        let as_seq = ItemId::from(needle.as_str());
+        if self.store.get_item(&as_seq).is_ok() {
+            return Ok(as_seq);
+        }
         let all = self.store.list_items(&Default::default())?;
         let matches: Vec<&Item> = all
             .iter()
@@ -55,6 +59,10 @@ impl Ctx {
             0 => Err(anyhow!("item not found: {id}")),
             n => Err(anyhow!("{id} is ambiguous: matches {n} items")),
         }
+    }
+
+    pub fn resolve_ids(&self, ids: &[String]) -> Result<Vec<ItemId>> {
+        ids.iter().map(|i| self.resolve_id(i)).collect()
     }
 
     pub fn emit<T: Serialize>(&self, value: &T, human: impl FnOnce() -> String) -> Result<()> {

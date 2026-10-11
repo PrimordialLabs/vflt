@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Core types, Store trait and file store for the vflt fleet orchestrator"
+description = "Core types, state machine, Store trait, and the file and sqlite stores for the vflt fleet orchestrator"
 
 [dependencies]
 anyhow.workspace = true
@@ -15,6 +15,7 @@ toml.workspace = true
 chrono.workspace = true
 ulid.workspace = true
 humantime.workspace = true
+rusqlite.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

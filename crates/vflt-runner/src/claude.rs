@@ -72,6 +72,10 @@ impl ClaudeRunner {
             "--max-turns".into(),
             req.budget.max_turns.to_string(),
         ];
+        if let Some(m) = req.model.as_deref().filter(|m| !m.trim().is_empty()) {
+            a.push("--model".into());
+            a.push(m.to_string());
+        }
         if !req.policy.allowed_tools.is_empty() {
             a.push("--allowedTools".into());
             a.push(req.policy.allowed_tools.join(","));
@@ -115,7 +119,9 @@ impl Runner for ClaudeRunner {
     fn run(&self, req: RunRequest) -> Result<RunOutcome> {
         std::fs::create_dir_all(&req.cwd)
             .with_context(|| format!("creating {}", req.cwd.display()))?;
-        let sys_path: PathBuf = req.cwd.join(".vflt-system-prompt.md");
+        std::fs::create_dir_all(&req.scratch_dir)
+            .with_context(|| format!("creating {}", req.scratch_dir.display()))?;
+        let sys_path: PathBuf = req.scratch_dir.join("system-prompt.md");
         std::fs::write(&sys_path, &req.system_prompt).context("writing system prompt file")?;
 
         // Resolve through `which` so PATHEXT shims (claude.cmd on Windows) spawn correctly.
@@ -245,7 +251,9 @@ mod tests {
             system_prompt: "sys".into(),
             prompt: "do it".into(),
             cwd: PathBuf::from("ws"),
+            scratch_dir: PathBuf::from("scratch"),
             extra_dirs: vec![PathBuf::from("dest")],
+            model: Some("some-model".into()),
             policy: Policy {
                 permission_mode: PermissionMode::Auto,
                 allowed_tools: vec!["Read".into(), "Bash(vflt *)".into()],
@@ -260,6 +268,7 @@ mod tests {
             budget: Budget {
                 max_turns: 7,
                 wall_clock: "5m".into(),
+                daily_usd: None,
             },
             env: vec![],
             log_path: None,
@@ -281,6 +290,7 @@ mod tests {
         assert!(s.contains("--permission-prompts none"));
         assert!(s.contains("--append-system-prompt-file sys.md"));
         assert!(s.contains("--max-turns 7"));
+        assert!(s.contains("--model some-model"));
         assert!(s.contains("--allowedTools Read,Bash(vflt *)"));
         assert!(s.contains("--disallowedTools Bash(rm -rf *)"));
         assert!(s.contains("--add-dir dest"));
@@ -298,7 +308,9 @@ mod tests {
         let r = ClaudeRunner::default();
         let mut q = req();
         q.policy = Policy::default();
+        q.model = None;
         let a = r.argv(&q, std::path::Path::new("sys.md"));
+        assert!(!a.contains(&"--model".to_string()));
         assert!(!a.contains(&"--settings".to_string()));
         assert!(!a.contains(&"--allowedTools".to_string()));
     }

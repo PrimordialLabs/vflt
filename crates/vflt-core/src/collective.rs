@@ -41,9 +41,27 @@ pub struct StoreConfig {
     /// For `file`: commit every state mutation to git.
     #[serde(default = "default_true")]
     pub git: bool,
-    /// For database and http stores: a connection string or base url.
+    /// For database and http stores: a connection string or base url. For
+    /// `sqlite`, a path relative to the collective root (default `board.db`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
+    /// For database stores: a directory, relative to the collective root,
+    /// kept as a plain-file mirror of every item (see `mirror`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mirror: Option<String>,
+}
+
+impl StoreConfig {
+    /// A sqlite store at `board.db` in the collective root.
+    pub fn sqlite() -> Self {
+        StoreConfig {
+            kind: StoreKind::Sqlite,
+            root: default_root(),
+            git: false,
+            url: None,
+            mirror: None,
+        }
+    }
 }
 
 fn default_root() -> String {
@@ -61,6 +79,7 @@ impl Default for StoreConfig {
             root: default_root(),
             git: true,
             url: None,
+            mirror: None,
         }
     }
 }
@@ -79,6 +98,19 @@ pub enum ClaimMode {
     Both,
 }
 
+/// How new item ids are minted.
+///
+/// * `ulid` (default): `vf-<ulid>`, unique without coordination.
+/// * `seq`: `vf-1`, `vf-2`, ... allocated atomically by the store; short and
+///   easy to say out loud.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IdStyle {
+    #[default]
+    Ulid,
+    Seq,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Collective {
     pub name: String,
@@ -91,9 +123,11 @@ pub struct Collective {
     /// Ordered stages. `complete` advances along this list.
     #[serde(default = "Stage::default_pipeline")]
     pub pipeline: Vec<Stage>,
-    /// Where `complete --bounce` sends an item.
+    /// Where `complete --bounce` sends an item that has no recorded origin.
     #[serde(default = "default_bounce_to")]
     pub bounce_to: Stage,
+    #[serde(default)]
+    pub ids: IdStyle,
     #[serde(default)]
     pub store: StoreConfig,
 }
@@ -115,6 +149,7 @@ impl Collective {
             claim_ttl: default_claim_ttl(),
             pipeline: Stage::default_pipeline(),
             bounce_to: default_bounce_to(),
+            ids: IdStyle::Ulid,
             store: StoreConfig::default(),
         }
     }

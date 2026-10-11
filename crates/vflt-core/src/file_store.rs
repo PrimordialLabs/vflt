@@ -3,11 +3,12 @@
 //! ```text
 //! collective.toml
 //! items/<id>/{spec.md,state.toml,notes/NNNN-<actor>.md,events.jsonl,.claim}
-//! agents/<id>.toml           tracked
+//! agents/<id>.toml           identity and control plane, tracked
 //! agents/<id>.hb             heartbeat timestamp, ignored by git
+//! agents/<id>.rt.json        runtime status, ignored by git
 //! profiles/<name>.{toml,md}
 //! events.jsonl
-//! work/                      per-item workspaces, ignored by git
+//! work/                      per-item workspaces and run logs, ignored by git
 //! ```
 
 use std::fs::{self, OpenOptions};
@@ -16,14 +17,15 @@ use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
 
-use crate::collective::{Collective, StoreKind};
-use crate::defaults;
+use crate::collective::{Collective, IdStyle, StoreKind};
 use crate::discover::CONFIG_FILE;
 use crate::error::{Error, Result};
 use crate::git;
-use crate::profile::Profile;
-use crate::store::Store;
+use crate::machine;
+use crate::store::{write_skeleton, Store};
 use crate::types::*;
+
+pub const GITIGNORE: &str = "# vflt: machine-local liveness state and per-item workspaces are not part of the board\nwork/\nagents/*.hb\nagents/*.rt.json\nitems/*/.claim\n";
 
 pub struct FileStore {
     /// Directory holding `collective.toml`.
@@ -37,28 +39,12 @@ pub struct FileStore {
 impl FileStore {
     /// Create a new collective at `root`.
     pub fn init(root: &Path, mut collective: Collective) -> Result<Self> {
-        let cfg = root.join(CONFIG_FILE);
-        if cfg.exists() {
-            return Err(Error::CollectiveExists(root.to_path_buf()));
-        }
         collective.store.kind = StoreKind::File;
-        mkdir(root)?;
         let data = root.join(&collective.store.root);
-        for d in ["items", "agents", "profiles", "work"] {
+        write_skeleton(root, &data, &collective, GITIGNORE)?;
+        for d in ["items", "agents"] {
             mkdir(&data.join(d))?;
         }
-        collective.save(&cfg)?;
-        for p in defaults::DEFAULT_PROFILES {
-            write(
-                &data.join("profiles").join(format!("{}.toml", p.name)),
-                p.toml,
-            )?;
-            write(
-                &data.join("profiles").join(format!("{}.md", p.name)),
-                p.prompt,
-            )?;
-        }
-        write(&root.join(".gitignore"), defaults::GITIGNORE)?;
         touch(&data.join("events.jsonl"))?;
 
         let git_repo = if collective.store.git {
@@ -115,20 +101,8 @@ impl FileStore {
         })
     }
 
-    pub fn root(&self) -> &Path {
-        &self.root
-    }
-
     pub fn data_dir(&self) -> &Path {
         &self.data
-    }
-
-    pub fn work_dir(&self) -> PathBuf {
-        self.data.join("work")
-    }
-
-    pub fn profiles_dir(&self) -> PathBuf {
-        self.data.join("profiles")
     }
 
     // -- paths --------------------------------------------------------------
@@ -173,6 +147,12 @@ impl FileStore {
             .join(format!("{}.hb", sanitize(id.as_str())))
     }
 
+    fn runtime_path(&self, id: &ActorId) -> PathBuf {
+        self.data
+            .join("agents")
+            .join(format!("{}.rt.json", sanitize(id.as_str())))
+    }
+
     // -- io helpers ---------------------------------------------------------
 
     fn read_state(&self, id: &ItemId) -> Result<ItemState> {
@@ -211,9 +191,13 @@ impl FileStore {
         }
     }
 
-    fn load_item(&self, st: ItemState) -> Result<Item> {
-        let spec_path = self.spec_path(&st.id);
-        let spec = fs::read_to_string(&spec_path).map_err(|e| Error::io(&spec_path, e))?;
+    fn load_item(&self, st: ItemState, with_spec: bool) -> Result<Item> {
+        let spec = if with_spec {
+            let spec_path = self.spec_path(&st.id);
+            fs::read_to_string(&spec_path).map_err(|e| Error::io(&spec_path, e))?
+        } else {
+            String::new()
+        };
         let claim = self.read_claim(&st.id)?;
         Ok(Item {
             state: st,
@@ -236,6 +220,39 @@ impl FileStore {
             .collect();
         ids.sort();
         Ok(ids)
+    }
+
+    /// Create the directory for a new item and return its id. Sequential ids
+    /// race through `create_dir`, which exactly one creator wins.
+    fn mint_item_dir(&self) -> Result<ItemId> {
+        let items = self.data.join("items");
+        mkdir(&items)?;
+        match self.collective.ids {
+            IdStyle::Ulid => {
+                let id = ItemId::generate();
+                mkdir(&self.item_dir(&id))?;
+                Ok(id)
+            }
+            IdStyle::Seq => {
+                let rd = fs::read_dir(&items).map_err(|e| Error::io(&items, e))?;
+                let mut next = rd
+                    .filter_map(|e| e.ok())
+                    .filter_map(|e| {
+                        ItemId(e.file_name().to_string_lossy().to_string()).seq_number()
+                    })
+                    .max()
+                    .unwrap_or(0)
+                    + 1;
+                loop {
+                    let id = ItemId::seq(next);
+                    match fs::create_dir(self.item_dir(&id)) {
+                        Ok(()) => return Ok(id),
+                        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => next += 1,
+                        Err(e) => return Err(Error::io(self.item_dir(&id), e)),
+                    }
+                }
+            }
+        }
     }
 
     fn commit(&self, paths: &[PathBuf], message: &str) {
@@ -270,42 +287,106 @@ impl FileStore {
         Ok(())
     }
 
-    /// Verify `by` may act on a claimed item: either holds the claim, or the
-    /// item is unclaimed.
-    fn check_holder(&self, id: &ItemId, by: &ActorId) -> Result<Option<Claim>> {
-        match self.read_claim(id)? {
-            Some(c) if &c.actor != by => Err(Error::NotClaimHolder {
-                item: id.to_string(),
-                holder: c.actor.to_string(),
-                actor: by.to_string(),
-            }),
-            other => Ok(other),
+    fn next_note_seq(&self, id: &ItemId) -> Result<u32> {
+        Ok(self.notes(id)?.last().map(|n| n.seq + 1).unwrap_or(1))
+    }
+
+    fn write_note(&self, id: &ItemId, note: &Note) -> Result<PathBuf> {
+        let dir = self.notes_dir(id);
+        mkdir(&dir)?;
+        let path = dir.join(note_file_name(note));
+        write(&path, &format_note(note))?;
+        Ok(path)
+    }
+
+    fn check_deps(&self, id: Option<&ItemId>, deps: &[ItemId]) -> Result<()> {
+        for d in deps {
+            if !self.state_path(d).exists() {
+                return Err(Error::ItemNotFound(format!("dependency {d}")));
+            }
+        }
+        if let Some(id) = id {
+            if machine::creates_cycle(id, deps, |d| Ok(self.read_state(d)?.deps))? {
+                return Err(Error::invalid(
+                    "deps",
+                    format!("depending on {} would create a cycle", join_ids(deps)),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn read_agent_config(&self, id: &ActorId) -> Result<AgentConfig> {
+        let p = self.agent_path(id);
+        let text = match fs::read_to_string(&p) {
+            Ok(t) => t,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Err(Error::AgentNotFound(id.to_string()))
+            }
+            Err(e) => return Err(Error::io(&p, e)),
+        };
+        Ok(toml::from_str(&text)?)
+    }
+
+    fn read_runtime(&self, id: &ActorId) -> Result<AgentRuntime> {
+        let p = self.runtime_path(id);
+        match fs::read_to_string(&p) {
+            Ok(t) => Ok(serde_json::from_str(&t).unwrap_or_default()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(AgentRuntime::default()),
+            Err(e) => Err(Error::io(&p, e)),
         }
     }
 
-    fn next_note_seq(&self, id: &ItemId) -> Result<u32> {
-        Ok(self.notes(id)?.last().map(|n| n.seq + 1).unwrap_or(1))
+    fn assemble_agent(&self, config: AgentConfig) -> Result<Agent> {
+        let runtime = self.read_runtime(&config.id)?;
+        let last_seen = self.last_heartbeat(&config.id)?;
+        Ok(Agent {
+            config,
+            runtime,
+            last_seen,
+        })
     }
 }
 
 // ---------------------------------------------------------------------------
 
 impl Store for FileStore {
+    fn root(&self) -> &Path {
+        &self.root
+    }
+
     fn collective(&self) -> Result<Collective> {
         Ok(self.collective.clone())
+    }
+
+    fn work_dir(&self) -> PathBuf {
+        self.data.join("work")
+    }
+
+    fn profiles_dir(&self) -> PathBuf {
+        self.data.join("profiles")
     }
 
     fn create_item(&self, spec: &str, meta: NewItem) -> Result<Item> {
         if meta.title.trim().is_empty() {
             return Err(Error::invalid("item", "title is empty"));
         }
-        for d in &meta.deps {
-            if !self.state_path(d).exists() {
-                return Err(Error::ItemNotFound(format!("dependency {d}")));
+        self.check_deps(None, &meta.deps)?;
+        if let Some(p) = &meta.parent {
+            if !self.state_path(p).exists() {
+                return Err(Error::ItemNotFound(format!("parent {p}")));
+            }
+        }
+        if let Some(k) = &meta.key {
+            if let Some(open) = self.open_by_key(k)? {
+                return Err(Error::invalid(
+                    "key",
+                    format!("{} already carries key {k:?}", open.id()),
+                ));
             }
         }
         let now = Utc::now();
-        let id = ItemId::generate();
+        let id = self.mint_item_dir()?;
         let stage = meta.stage.unwrap_or_else(|| {
             self.collective
                 .pipeline
@@ -313,21 +394,34 @@ impl Store for FileStore {
                 .cloned()
                 .unwrap_or(Stage::new(Stage::CODE))
         });
+        let origin = machine::origin_for_new(&stage, &meta.owner, meta.assignee.as_ref());
         let st = ItemState {
             id: id.clone(),
-            slug: slugify(&meta.title),
+            slug: item_slug(meta.slug.as_deref(), &meta.title),
             title: meta.title.trim().to_string(),
             stage,
-            status: Status::Pending,
+            status: if meta.draft {
+                Status::Draft
+            } else {
+                Status::Pending
+            },
             priority: meta.priority.unwrap_or_else(default_priority),
             owner: meta.owner.clone(),
             assignee: meta.assignee,
-            tags: meta.tags,
+            tags: normalize_tags(meta.tags),
             deps: meta.deps,
             created: now,
             updated: now,
+            closed: None,
             external: meta.external,
             waiting_on: None,
+            raise_kind: None,
+            parent: meta.parent,
+            origin,
+            bounces: 0,
+            returned: false,
+            summary: meta.summary.clone().filter(|s| !s.trim().is_empty()),
+            key: meta.key,
         };
         let dir = self.item_dir(&id);
         mkdir(&self.notes_dir(&id))?;
@@ -341,15 +435,15 @@ impl Store for FileStore {
         self.write_state(&st)?;
         self.record(
             Event::new(&meta.owner, "item.created", Some(&id), format!("created {id} \"{}\" at {}", st.title, st.stage))
-                .with_detail(serde_json::json!({"stage": st.stage, "priority": st.priority, "assignee": st.assignee})),
+                .with_detail(serde_json::json!({"stage": st.stage, "status": st.status, "priority": st.priority, "assignee": st.assignee})),
             &[dir],
         )?;
-        self.load_item(st)
+        self.load_item(st, true)
     }
 
     fn get_item(&self, id: &ItemId) -> Result<Item> {
         let st = self.read_state(id)?;
-        self.load_item(st)
+        self.load_item(st, true)
     }
 
     fn list_items(&self, filter: &ItemFilter) -> Result<Vec<Item>> {
@@ -357,7 +451,7 @@ impl Store for FileStore {
         for id in self.item_ids()? {
             let st = self.read_state(&id)?;
             if filter.matches(&st) {
-                out.push(self.load_item(st)?);
+                out.push(self.load_item(st, false)?);
             }
         }
         out.sort_by(|a, b| a.priority.cmp(&b.priority).then(a.created.cmp(&b.created)));
@@ -402,6 +496,7 @@ impl Store for FileStore {
         let mut st = st;
         st.status = Status::Claimed;
         st.assignee = Some(by.clone());
+        st.returned = false;
         st.updated = Utc::now();
         let p = self.write_state(&st)?;
         self.record(
@@ -468,167 +563,88 @@ impl Store for FileStore {
 
     fn transition(&self, id: &ItemId, by: &ActorId, to: Transition) -> Result<Item> {
         let mut st = self.read_state(id)?;
-        let from = st.status;
-        let verb = to.verb();
-        let bad = || Error::InvalidTransition {
-            item: id.to_string(),
-            verb,
-            from: from.to_string(),
-        };
-        let mut touched = vec![self.state_path(id)];
-        let mut extra_note: Option<String> = None;
-        let (kind, summary, detail): (&str, String, serde_json::Value) = match to {
-            Transition::Start => {
-                match from {
-                    Status::Claimed => {
-                        self.check_holder(id, by)?;
-                    }
-                    Status::Pending => {
-                        // implicit claim
-                        self.claim(id, by)?;
-                    }
-                    _ => return Err(bad()),
-                }
-                st.status = Status::InProgress;
-                (
-                    "item.started",
-                    format!("{by} started {id}"),
-                    serde_json::Value::Null,
-                )
-            }
-            Transition::Complete {
-                bounce,
-                to_stage,
-                note,
-            } => {
-                if !matches!(from, Status::InProgress | Status::Claimed) {
-                    return Err(bad());
-                }
-                self.check_holder(id, by)?;
-                let prev_stage = st.stage.clone();
-                let target: Option<Stage> = if let Some(s) = to_stage {
-                    Some(s)
-                } else if bounce {
-                    Some(self.collective.bounce_to.clone())
-                } else {
-                    self.collective.next_stage(&st.stage).cloned()
-                };
-                self.remove_claim(id)?;
-                extra_note = note;
-                match target {
-                    Some(s) if !self.collective.is_terminal_stage(&s) => {
-                        st.stage = s;
-                        st.status = Status::Pending;
-                        st.assignee = None;
-                        st.waiting_on = None;
-                        let kind = if bounce {
-                            "item.bounced"
-                        } else {
-                            "item.completed"
-                        };
-                        (
-                            kind,
-                            format!(
-                                "{by} completed {id} at {prev_stage}; now {} at {}",
-                                st.status, st.stage
-                            ),
-                            serde_json::json!({"from_stage": prev_stage, "to_stage": st.stage, "bounce": bounce}),
-                        )
-                    }
-                    _ => {
-                        st.stage = self.collective.terminal_stage().clone();
-                        st.status = Status::Done;
-                        st.waiting_on = None;
-                        (
-                            "item.completed",
-                            format!("{by} completed {id} at {prev_stage}; done"),
-                            serde_json::json!({"from_stage": prev_stage, "to_stage": st.stage, "bounce": bounce}),
-                        )
-                    }
-                }
-            }
-            Transition::Block { on } => {
-                if !matches!(from, Status::InProgress | Status::Claimed) {
-                    return Err(bad());
-                }
-                self.check_holder(id, by)?;
-                self.remove_claim(id)?;
-                st.status = Status::Blocked;
-                st.waiting_on = Some(on.clone());
-                (
-                    "item.blocked",
-                    format!("{by} blocked {id} on: {on}"),
-                    serde_json::json!({"on": on}),
-                )
-            }
-            Transition::Raise { question } => {
-                if from.is_terminal() {
-                    return Err(bad());
-                }
-                self.check_holder(id, by)?;
-                self.remove_claim(id)?;
-                st.status = Status::NeedsHuman;
-                st.waiting_on = Some(question.clone());
-                (
-                    "item.raised",
-                    format!("{by} raised {id} for a human: {question}"),
-                    serde_json::json!({"question": question}),
-                )
-            }
-            Transition::Handoff { to: target, stage } => {
-                if from.is_terminal() {
-                    return Err(bad());
-                }
-                self.check_holder(id, by)?;
-                self.remove_claim(id)?;
-                st.status = Status::Pending;
-                st.assignee = Some(target.clone());
-                st.waiting_on = None;
-                if let Some(s) = stage {
-                    st.stage = s;
-                }
-                (
-                    "item.handoff",
-                    format!("{by} handed {id} to {target} at {}", st.stage),
-                    serde_json::json!({"to": target, "stage": st.stage}),
-                )
-            }
-            Transition::Reopen => {
-                if !matches!(from, Status::Blocked | Status::NeedsHuman) {
-                    return Err(bad());
-                }
-                st.status = Status::Pending;
-                st.waiting_on = None;
-                (
-                    "item.reopened",
-                    format!("{by} reopened {id}"),
-                    serde_json::Value::Null,
-                )
-            }
-            Transition::Cancel => {
-                if from.is_terminal() {
-                    return Err(bad());
-                }
-                self.remove_claim(id)?;
-                st.status = Status::Cancelled;
-                (
-                    "item.cancelled",
-                    format!("{by} cancelled {id}"),
-                    serde_json::Value::Null,
-                )
-            }
-        };
-        st.updated = Utc::now();
-        self.write_state(&st)?;
-        if let Some(body) = extra_note {
-            let n = self.add_note(id, by, &body)?;
-            touched.push(self.notes_dir(id).join(note_file_name(&n)));
+        if to == Transition::Start && st.status == Status::Pending {
+            // implicit claim
+            self.claim(id, by)?;
+            st = self.read_state(id)?;
+        }
+        if let Transition::Wait { on } = &to {
+            self.check_deps(Some(id), on)?;
+        }
+        let claim = self.read_claim(id)?;
+        let applied = machine::apply(
+            &self.collective,
+            &mut st,
+            claim.as_ref(),
+            by,
+            to,
+            Utc::now(),
+        )?;
+        if applied.drop_claim {
+            self.remove_claim(id)?;
+        }
+        let mut touched = vec![self.write_state(&st)?];
+        if let Some(body) = applied.note {
+            let seq = self.next_note_seq(id)?;
+            let n = Note {
+                seq,
+                actor: by.clone(),
+                at: Utc::now(),
+                body: normalize_newlines(body.trim_end()).trim_end().to_string(),
+            };
+            touched.push(self.write_note(id, &n)?);
         }
         self.record(
-            Event::new(by, kind, Some(id), summary).with_detail(detail),
+            Event::new(by, applied.kind, Some(id), applied.summary).with_detail(applied.detail),
             &touched,
         )?;
-        self.load_item(st)
+        self.load_item(st, false)
+    }
+
+    fn update_item(&self, id: &ItemId, by: &ActorId, u: ItemUpdate) -> Result<Item> {
+        let mut st = self.read_state(id)?;
+        if u.is_empty() {
+            return self.load_item(st, true);
+        }
+        let mut touched = vec![self.state_path(id)];
+        let mut changes: Vec<String> = Vec::new();
+        if !u.add_deps.is_empty() {
+            self.check_deps(Some(id), &u.add_deps)?;
+        }
+        if let Some(Some(p)) = &u.parent {
+            if !self.state_path(p).exists() {
+                return Err(Error::ItemNotFound(format!("parent {p}")));
+            }
+        }
+        if let Some(spec) = &u.spec {
+            if st.status != Status::Draft {
+                return Err(Error::invalid(
+                    "spec",
+                    format!(
+                        "{id} is {}; only a draft's spec may change (add a note instead)",
+                        st.status
+                    ),
+                ));
+            }
+            let p = self.spec_path(id);
+            write(&p, &normalize_newlines(spec))?;
+            touched.push(p);
+            changes.push("spec".into());
+        }
+        apply_update(&mut st, u, &mut changes);
+        st.updated = Utc::now();
+        self.write_state(&st)?;
+        self.record(
+            Event::new(
+                by,
+                "item.updated",
+                Some(id),
+                format!("{by} updated {id}: {}", changes.join(", ")),
+            )
+            .with_detail(serde_json::json!({"changes": changes})),
+            &touched,
+        )?;
+        self.get_item(id)
     }
 
     fn add_note(&self, id: &ItemId, by: &ActorId, body: &str) -> Result<Note> {
@@ -638,12 +654,9 @@ impl Store for FileStore {
             seq,
             actor: by.clone(),
             at: Utc::now(),
-            body: normalize_newlines(body.trim_end()),
+            body: normalize_newlines(body.trim_end()).trim_end().to_string(),
         };
-        let dir = self.notes_dir(id);
-        mkdir(&dir)?;
-        let path = dir.join(note_file_name(&note));
-        write(&path, &format_note(&note))?;
+        let path = self.write_note(id, &note)?;
         self.record(
             Event::new(
                 by,
@@ -688,7 +701,7 @@ impl Store for FileStore {
             None => format!("{by} returned {id} to the pool"),
         };
         self.record(Event::new(by, "item.assigned", Some(id), summary), &[p])?;
-        self.load_item(st)
+        self.load_item(st, false)
     }
 
     fn link_external(&self, id: &ItemId, by: &ActorId, ext: ExternalRef) -> Result<Item> {
@@ -698,7 +711,7 @@ impl Store for FileStore {
         st.updated = Utc::now();
         let p = self.write_state(&st)?;
         self.record(Event::new(by, "item.linked", Some(id), summary), &[p])?;
-        self.load_item(st)
+        self.load_item(st, false)
     }
 
     // -- agents -------------------------------------------------------------
@@ -709,40 +722,11 @@ impl Store for FileStore {
             return Err(Error::invalid("agent", "name is empty"));
         }
         let id = ActorId::new(name);
-        let now = Utc::now();
-        let existing = self.get_agent(&id).ok();
-        let agent = Agent {
-            id: id.clone(),
-            name: name.to_string(),
-            profiles: if a.profiles.is_empty() {
-                existing
-                    .as_ref()
-                    .map(|e| e.profiles.clone())
-                    .unwrap_or_default()
-            } else {
-                a.profiles
-            },
-            kind: a
-                .kind
-                .or(existing.as_ref().map(|e| e.kind))
-                .unwrap_or(AgentKind::Local),
-            host: a.host.unwrap_or_else(hostname),
-            remote: a
-                .remote
-                .or(existing.as_ref().and_then(|e| e.remote.clone())),
-            status: AgentStatus::Active,
-            registered: existing.as_ref().map(|e| e.registered).unwrap_or(now),
-            last_seen: now,
-            lent_to: existing.as_ref().and_then(|e| e.lent_to.clone()),
-            lent_from: a
-                .lent_from
-                .or(existing.as_ref().and_then(|e| e.lent_from.clone())),
-            pid: a.pid,
-        };
+        let existing = self.read_agent_config(&id).ok();
+        let cfg = new_agent_config(&id, a, existing.as_ref());
         mkdir(&self.data.join("agents"))?;
         let p = self.agent_path(&id);
-        write_atomic(&p, &toml::to_string_pretty(&agent)?)?;
-        self.heartbeat(&id)?;
+        write_atomic(&p, &toml::to_string_pretty(&cfg)?)?;
         let kind = if existing.is_some() {
             "agent.resumed"
         } else {
@@ -760,42 +744,34 @@ impl Store for FileStore {
                     } else {
                         "registered"
                     },
-                    agent.profiles
+                    cfg.profiles
                 ),
             ),
             &[p],
         )?;
-        Ok(agent)
+        self.assemble_agent(cfg)
     }
 
     fn get_agent(&self, id: &ActorId) -> Result<Agent> {
-        let p = self.agent_path(id);
-        let text = match fs::read_to_string(&p) {
-            Ok(t) => t,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return Err(Error::AgentNotFound(id.to_string()))
-            }
-            Err(e) => return Err(Error::io(&p, e)),
-        };
-        let mut a: Agent = toml::from_str(&text)?;
-        if let Some(hb) = self.last_heartbeat(id)? {
-            a.last_seen = hb;
-        }
-        Ok(a)
+        let cfg = self.read_agent_config(id)?;
+        self.assemble_agent(cfg)
     }
 
-    fn update_agent(&self, a: &Agent) -> Result<()> {
-        let p = self.agent_path(&a.id);
-        write_atomic(&p, &toml::to_string_pretty(a)?)?;
+    fn update_agent(&self, cfg: &AgentConfig, by: &ActorId, summary: &str) -> Result<()> {
+        if !self.agent_path(&cfg.id).exists() {
+            return Err(Error::AgentNotFound(cfg.id.to_string()));
+        }
+        let p = self.agent_path(&cfg.id);
+        write_atomic(&p, &toml::to_string_pretty(cfg)?)?;
         self.record(
-            Event::new(
-                &a.id,
-                "agent.updated",
-                None,
-                format!("agent {} updated", a.id),
-            ),
+            Event::new(by, "agent.updated", None, summary.to_string()),
             &[p],
         )
+    }
+
+    fn set_runtime(&self, id: &ActorId, rt: &AgentRuntime) -> Result<()> {
+        // Runtime is machine-local liveness; never committed.
+        write_atomic(&self.runtime_path(id), &serde_json::to_string_pretty(rt)?)
     }
 
     fn heartbeat(&self, id: &ActorId) -> Result<()> {
@@ -829,13 +805,10 @@ impl Store for FileStore {
                 continue;
             }
             let text = fs::read_to_string(&p).map_err(|e| Error::io(&p, e))?;
-            let mut a: Agent = toml::from_str(&text)?;
-            if let Some(hb) = self.last_heartbeat(&a.id)? {
-                a.last_seen = hb;
-            }
-            out.push(a);
+            let cfg: AgentConfig = toml::from_str(&text)?;
+            out.push(self.assemble_agent(cfg)?);
         }
-        out.sort_by(|a, b| a.name.cmp(&b.name));
+        out.sort_by(|a, b| a.config.name.cmp(&b.config.name));
         Ok(out)
     }
 
@@ -846,6 +819,7 @@ impl Store for FileStore {
         }
         fs::remove_file(&p).map_err(|e| Error::io(&p, e))?;
         let _ = fs::remove_file(self.heartbeat_path(id));
+        let _ = fs::remove_file(self.runtime_path(id));
         self.record(
             Event::new(
                 id,
@@ -857,11 +831,7 @@ impl Store for FileStore {
         )
     }
 
-    // -- profiles & events --------------------------------------------------
-
-    fn profiles(&self) -> Result<Vec<Profile>> {
-        Profile::load_all(&self.profiles_dir())
-    }
+    // -- events -------------------------------------------------------------
 
     fn append_event(&self, e: Event) -> Result<()> {
         let paths = self.append_event_raw(&e)?;
@@ -890,8 +860,184 @@ impl Store for FileStore {
                 out.push(e);
             }
         }
+        if let Some(n) = filter.limit {
+            let skip = out.len().saturating_sub(n);
+            out.drain(..skip);
+        }
         Ok(out)
     }
+
+    // -- bundles ------------------------------------------------------------
+
+    fn import_record(&self, rec: BundleRecord) -> Result<()> {
+        match rec {
+            BundleRecord::Item { state, spec } => {
+                let dir = self.item_dir(&state.id);
+                if dir.join("state.toml").exists() {
+                    return Err(Error::invalid(
+                        "import",
+                        format!("{} already exists", state.id),
+                    ));
+                }
+                mkdir(&self.notes_dir(&state.id))?;
+                write(&self.spec_path(&state.id), &normalize_newlines(&spec))?;
+                touch(&self.item_events_path(&state.id))?;
+                self.write_state(&state)?;
+            }
+            BundleRecord::Note { item, note } => {
+                self.read_state(&item)?;
+                self.write_note(&item, &note)?;
+            }
+            BundleRecord::Event(e) => {
+                self.append_event_raw(&e)?;
+            }
+            BundleRecord::Agent(cfg) => {
+                mkdir(&self.data.join("agents"))?;
+                write_atomic(&self.agent_path(&cfg.id), &toml::to_string_pretty(&cfg)?)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn export_records(&self) -> Result<Vec<BundleRecord>> {
+        let mut out = Vec::new();
+        let ids = self.item_ids()?;
+        for id in &ids {
+            let st = self.read_state(id)?;
+            let spec = fs::read_to_string(self.spec_path(id))
+                .map_err(|e| Error::io(self.spec_path(id), e))?;
+            out.push(BundleRecord::Item { state: st, spec });
+        }
+        for id in &ids {
+            for note in self.notes(id)? {
+                out.push(BundleRecord::Note {
+                    item: id.clone(),
+                    note,
+                });
+            }
+        }
+        for e in self.events(&EventFilter::default())? {
+            out.push(BundleRecord::Event(e));
+        }
+        for a in self.list_agents()? {
+            out.push(BundleRecord::Agent(a.config));
+        }
+        Ok(out)
+    }
+}
+
+/// Apply the metadata half of an update (everything except the spec).
+pub(crate) fn apply_update(st: &mut ItemState, u: ItemUpdate, changes: &mut Vec<String>) {
+    if let Some(t) = u.title {
+        let t = t.trim().to_string();
+        if !t.is_empty() && t != st.title {
+            st.title = t;
+            changes.push("title".into());
+        }
+    }
+    if let Some(sm) = u.summary {
+        let sm = sm.trim().to_string();
+        let new = if sm.is_empty() { None } else { Some(sm) };
+        if new != st.summary {
+            st.summary = new;
+            changes.push("summary".into());
+        }
+    }
+    if let Some(p) = u.priority {
+        if p != st.priority {
+            st.priority = p;
+            changes.push(format!("priority {p}"));
+        }
+    }
+    let add = normalize_tags(u.add_tags);
+    let remove = normalize_tags(u.remove_tags);
+    for t in add {
+        if !st.tags.contains(&t) {
+            changes.push(format!("+{t}"));
+            st.tags.push(t);
+        }
+    }
+    for t in remove {
+        if let Some(i) = st.tags.iter().position(|x| x == &t) {
+            st.tags.remove(i);
+            changes.push(format!("-{t}"));
+        }
+    }
+    for d in u.add_deps {
+        if !st.deps.contains(&d) && d != st.id {
+            changes.push(format!("dep +{d}"));
+            st.deps.push(d);
+        }
+    }
+    for d in u.remove_deps {
+        if let Some(i) = st.deps.iter().position(|x| x == &d) {
+            st.deps.remove(i);
+            changes.push(format!("dep -{d}"));
+        }
+    }
+    if let Some(p) = u.parent {
+        if p != st.parent {
+            changes.push(match &p {
+                Some(p) => format!("parent {p}"),
+                None => "parent cleared".into(),
+            });
+            st.parent = p;
+        }
+    }
+}
+
+pub(crate) fn new_agent_config(
+    id: &ActorId,
+    a: NewAgent,
+    existing: Option<&AgentConfig>,
+) -> AgentConfig {
+    let now = Utc::now();
+    match existing {
+        Some(e) => {
+            let mut c = e.clone();
+            if !a.profiles.is_empty() {
+                c.profiles = a.profiles;
+            }
+            if let Some(k) = a.kind {
+                c.kind = k;
+            }
+            if let Some(h) = a.host {
+                c.host = h;
+            }
+            if a.remote.is_some() {
+                c.remote = a.remote;
+            }
+            if a.lent_from.is_some() {
+                c.lent_from = a.lent_from;
+            }
+            c
+        }
+        None => AgentConfig {
+            id: id.clone(),
+            name: id.to_string(),
+            profiles: a.profiles,
+            kind: a.kind.unwrap_or(AgentKind::Local),
+            host: a.host.unwrap_or_else(hostname),
+            remote: a.remote,
+            registered: now,
+            lent_to: None,
+            lent_from: a.lent_from,
+            desired: Desired::Running,
+            hold: false,
+            model: None,
+            cycle: None,
+            wall_clock: None,
+            daily_usd: None,
+            wake_requested: None,
+        },
+    }
+}
+
+pub(crate) fn join_ids(ids: &[ItemId]) -> String {
+    ids.iter()
+        .map(|d| d.as_str())
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 // ---------------------------------------------------------------------------
@@ -971,18 +1117,22 @@ fn write_atomic(p: &Path, text: &str) -> Result<()> {
         .parent()
         .ok_or_else(|| Error::invalid("path", p.display().to_string()))?;
     mkdir(dir)?;
-    let tmp = dir.join(format!(
-        ".{}.{}.tmp",
-        p.file_name()
-            .map(|s| s.to_string_lossy().to_string())
-            .unwrap_or_default(),
-        std::process::id()
-    ));
+    let tmp = dir.join(
+        format!(
+            ".{}.{}.{:?}.tmp",
+            p.file_name()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_default(),
+            std::process::id(),
+            std::thread::current().id()
+        )
+        .replace(['(', ')'], ""),
+    );
     write(&tmp, text)?;
     fs::rename(&tmp, p).map_err(|e| Error::io(p, e))
 }
 
-fn normalize_newlines(s: &str) -> String {
+pub(crate) fn normalize_newlines(s: &str) -> String {
     let mut out = s.replace("\r\n", "\n");
     if !out.ends_with('\n') {
         out.push('\n');
@@ -1013,6 +1163,7 @@ pub fn hostname() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::defaults;
     use std::sync::Arc;
 
     fn store() -> (tempfile::TempDir, FileStore) {
@@ -1213,7 +1364,9 @@ mod tests {
             s.transition(&id, &coder, Transition::Start),
             Err(Error::InvalidTransition { .. })
         ));
-        let it = s.transition(&id, &human, Transition::Reopen).unwrap();
+        let it = s
+            .transition(&id, &human, Transition::Reopen { to: None })
+            .unwrap();
         assert_eq!(it.status, Status::Pending);
         assert_eq!(it.waiting_on, None);
 
@@ -1225,6 +1378,7 @@ mod tests {
                 &coder,
                 Transition::Raise {
                     question: "which db?".into(),
+                    kind: RaiseKind::Decision,
                 },
             )
             .unwrap();
@@ -1319,6 +1473,7 @@ mod tests {
             ..Default::default()
         })
         .unwrap();
+        s.heartbeat(&a).unwrap();
         let claim = s.claim(it.id(), &a).unwrap();
         assert!(!s.is_stale(&claim).unwrap());
         let old = (Utc::now() - chrono::Duration::hours(2)).to_rfc3339();
@@ -1361,8 +1516,10 @@ mod tests {
                 ..Default::default()
             })
             .unwrap();
-        assert_eq!(a.kind, AgentKind::Local);
-        assert!(s.last_heartbeat(&a.id).unwrap().is_some());
+        assert_eq!(a.config.kind, AgentKind::Local);
+        assert!(s.last_heartbeat(a.id()).unwrap().is_none());
+        s.heartbeat(a.id()).unwrap();
+        assert!(s.last_heartbeat(a.id()).unwrap().is_some());
         // resume keeps profiles when none given
         let again = s
             .register_agent(NewAgent {
@@ -1370,12 +1527,30 @@ mod tests {
                 ..Default::default()
             })
             .unwrap();
-        assert_eq!(again.profiles, vec!["coder".to_string()]);
-        assert_eq!(again.registered, a.registered);
+        assert_eq!(again.config.profiles, vec!["coder".to_string()]);
+        assert_eq!(again.config.registered, a.config.registered);
         assert_eq!(s.list_agents().unwrap().len(), 1);
-        s.deregister_agent(&a.id).unwrap();
+        // control plane and runtime are stored apart
+        let mut cfg = again.config.clone();
+        cfg.desired = Desired::Paused;
+        cfg.hold = true;
+        s.update_agent(&cfg, &ActorId::from("ops"), "paused coder-1")
+            .unwrap();
+        s.set_runtime(
+            a.id(),
+            &AgentRuntime {
+                status: AgentStatus::Paused,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let got = s.get_agent(a.id()).unwrap();
+        assert_eq!(got.config.desired, Desired::Paused);
+        assert!(got.config.hold);
+        assert_eq!(got.runtime.status, AgentStatus::Paused);
+        s.deregister_agent(a.id()).unwrap();
         assert!(s.list_agents().unwrap().is_empty());
-        assert!(matches!(s.get_agent(&a.id), Err(Error::AgentNotFound(_))));
+        assert!(matches!(s.get_agent(a.id()), Err(Error::AgentNotFound(_))));
     }
 
     #[test]

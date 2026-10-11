@@ -1,7 +1,8 @@
 //! A runner that spawns an arbitrary command template. The template is split
 //! shlex-style into argv and executed directly, never via a shell. The prompt
 //! arrives on stdin; `VFLT_PROMPT_FILE` and `VFLT_SYSTEM_PROMPT_FILE` point at
-//! files holding the prompt and system prompt for runners that prefer paths.
+//! files holding the prompt and system prompt for runners that prefer paths,
+//! and `VFLT_MODEL` names the model when the profile or agent sets one.
 
 use anyhow::{bail, Context, Result};
 
@@ -110,8 +111,10 @@ impl Runner for ShellRunner {
     fn run(&self, req: RunRequest) -> Result<RunOutcome> {
         std::fs::create_dir_all(&req.cwd)
             .with_context(|| format!("creating {}", req.cwd.display()))?;
-        let prompt_path = req.cwd.join(".vflt-prompt.md");
-        let sys_path = req.cwd.join(".vflt-system-prompt.md");
+        std::fs::create_dir_all(&req.scratch_dir)
+            .with_context(|| format!("creating {}", req.scratch_dir.display()))?;
+        let prompt_path = req.scratch_dir.join("prompt.md");
+        let sys_path = req.scratch_dir.join("system-prompt.md");
         std::fs::write(&prompt_path, &req.prompt)?;
         std::fs::write(&sys_path, &req.system_prompt)?;
 
@@ -124,6 +127,9 @@ impl Runner for ShellRunner {
             "VFLT_SYSTEM_PROMPT_FILE".into(),
             sys_path.to_string_lossy().into_owned(),
         ));
+        if let Some(m) = req.model.as_deref().filter(|m| !m.trim().is_empty()) {
+            env.push(("VFLT_MODEL".into(), m.to_string()));
+        }
 
         let mut argv = self.argv()?;
         if std::path::Path::new(&argv[0]).components().count() == 1 {
