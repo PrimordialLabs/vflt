@@ -946,13 +946,14 @@ impl Store for SqliteStore {
                     .map_err(db_err)?;
             }
             write_state(tx, &st)?;
+            let mut detail = applied.detail;
             if let Some(body) = &applied.note {
-                new_note(tx, id, by, body)?;
+                let n = new_note(tx, id, by, body)?;
+                detail["note_seq"] = serde_json::json!(n.seq);
             }
             insert_event(
                 tx,
-                &Event::new(by, applied.kind, Some(id), applied.summary)
-                    .with_detail(applied.detail),
+                &Event::new(by, applied.kind, Some(id), applied.summary).with_detail(detail),
             )?;
             load_item(tx, st, false)
         })?;
@@ -1022,7 +1023,8 @@ impl Store for SqliteStore {
                     "item.noted",
                     Some(id),
                     format!("{by} noted {id} (#{})", note.seq),
-                ),
+                )
+                .with_detail(serde_json::json!({"seq": note.seq})),
             )?;
             Ok(note)
         })?;

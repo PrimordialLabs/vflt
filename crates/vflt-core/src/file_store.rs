@@ -584,6 +584,7 @@ impl Store for FileStore {
             self.remove_claim(id)?;
         }
         let mut touched = vec![self.write_state(&st)?];
+        let mut detail = applied.detail;
         if let Some(body) = applied.note {
             let seq = self.next_note_seq(id)?;
             let n = Note {
@@ -593,9 +594,10 @@ impl Store for FileStore {
                 body: normalize_newlines(body.trim_end()).trim_end().to_string(),
             };
             touched.push(self.write_note(id, &n)?);
+            detail["note_seq"] = serde_json::json!(seq);
         }
         self.record(
-            Event::new(by, applied.kind, Some(id), applied.summary).with_detail(applied.detail),
+            Event::new(by, applied.kind, Some(id), applied.summary).with_detail(detail),
             &touched,
         )?;
         self.load_item(st, false)
@@ -663,7 +665,8 @@ impl Store for FileStore {
                 "item.noted",
                 Some(id),
                 format!("{by} noted {id} (#{seq})"),
-            ),
+            )
+            .with_detail(serde_json::json!({"seq": seq})),
             &[path],
         )?;
         Ok(note)

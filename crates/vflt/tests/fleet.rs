@@ -277,6 +277,26 @@ fn sqlite_board_ids_filters_and_mirror() {
         .as_str()
         .unwrap()
         .contains("superseded"));
+    let noted = cancel["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["kind"] == "item.noted")
+        .unwrap();
+    assert_eq!(noted["detail"]["seq"], 1);
+    assert_eq!(
+        c.json(&["--as", "w", "item", "start", "2"])["status"],
+        "in_progress"
+    );
+    c.ok(&["--as", "w", "item", "complete", "2", "--note", "shipped"]);
+    let done = c.json(&["item", "show", "2", "--events"]);
+    let ev = done["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["kind"] == "item.completed")
+        .unwrap();
+    assert_eq!(ev["detail"]["note_seq"], 1);
 
     // the mirror tracks every change and can rebuild a board on its own
     let mirror = c.root.join("mirror").join("vf-2.md");
@@ -290,6 +310,7 @@ fn sqlite_board_ids_filters_and_mirror() {
         c.root.join("mirror").to_str().unwrap(),
     ]);
     assert_eq!(other.show("2")["title"], "Second, retitled");
+    assert_eq!(other.show("2")["status"], "done");
     assert!(other.show("1")["status"] == "cancelled");
     assert_eq!(
         other.add("lead", "next", "worker"),
