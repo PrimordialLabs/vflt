@@ -50,17 +50,6 @@ fn compact(secs: u64) -> String {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn ages_are_compact() {
-        assert_eq!(super::compact(5), "5s");
-        assert_eq!(super::compact(125), "2m");
-        assert_eq!(super::compact(7_300), "2h");
-        assert_eq!(super::compact(70 * 86_400 + 9_000), "70d");
-    }
-}
-
 pub fn truncate(s: &str, n: usize) -> String {
     let s = s.lines().next().unwrap_or("");
     if s.chars().count() <= n {
@@ -105,4 +94,15 @@ pub fn table(headers: &[&str], rows: &[Vec<String>]) -> String {
         out.push('\n');
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn ages_are_compact() {
+        assert_eq!(super::compact(5), "5s");
+        assert_eq!(super::compact(125), "2m");
+        assert_eq!(super::compact(7_300), "2h");
+        assert_eq!(super::compact(70 * 86_400 + 9_000), "70d");
+    }
 }
