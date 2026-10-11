@@ -146,7 +146,53 @@ pub(crate) fn write_skeleton(
             std::fs::write(&path, text).map_err(|e| Error::io(&path, e))?;
         }
     }
-    let gi = root.join(".gitignore");
-    std::fs::write(&gi, gitignore).map_err(|e| Error::io(&gi, e))?;
-    Ok(())
+    merge_gitignore(&root.join(".gitignore"), gitignore)
+}
+
+/// Add the lines of `wanted` that `path` lacks, keeping whatever is there:
+/// a collective may be created inside a directory that already ignores
+/// things of its own.
+pub(crate) fn merge_gitignore(path: &Path, wanted: &str) -> Result<()> {
+    let existing = match std::fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(Error::io(path, e)),
+    };
+    let have: std::collections::HashSet<&str> = existing.lines().map(str::trim).collect();
+    let missing: Vec<&str> = wanted
+        .lines()
+        .filter(|l| !l.trim().is_empty() && !have.contains(l.trim()))
+        .collect();
+    if missing.is_empty() {
+        return Ok(());
+    }
+    let mut out = existing.clone();
+    if !out.is_empty() && !out.ends_with('\n') {
+        out.push('\n');
+    }
+    for l in missing {
+        out.push_str(l);
+        out.push('\n');
+    }
+    std::fs::write(path, out).map_err(|e| Error::io(path, e))
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn gitignore_is_merged_not_replaced() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join(".gitignore");
+        std::fs::write(&p, "own/\nwork/").unwrap();
+        super::merge_gitignore(&p, "# vflt\nwork/\n*.db\n").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&p).unwrap(),
+            "own/\nwork/\n# vflt\n*.db\n"
+        );
+        super::merge_gitignore(&p, "*.db\n").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&p).unwrap(),
+            "own/\nwork/\n# vflt\n*.db\n"
+        );
+    }
 }
