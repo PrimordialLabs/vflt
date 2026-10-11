@@ -7,6 +7,7 @@ mod ctx;
 mod fleet;
 mod identity;
 mod prompt;
+mod shutdown;
 mod util;
 
 use clap::Parser;

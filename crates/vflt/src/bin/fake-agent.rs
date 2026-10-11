@@ -12,6 +12,7 @@
 //! * `noop`: exit 0 without transitioning (the loop must raise the items)
 //! * `fail`: exit 2 without transitioning
 //! * `hang`: sleep 30s (used to test the wall-clock kill)
+//! * `slow`: sleep 3s, then behave like `complete` (used to test graceful stops)
 //! * `cycle`: print a summary and exit (for cycle turns)
 //! * `file`: (cycle turn) file one item for this agent, then exit
 //! * `snooze`: (cycle turn) snooze this agent, then exit
@@ -59,6 +60,12 @@ fn main() {
         }
     };
 
+    let mode = if mode == "slow" {
+        std::thread::sleep(std::time::Duration::from_secs(3));
+        "complete".to_string()
+    } else {
+        mode
+    };
     match mode.as_str() {
         "complete" => {
             for item in &items {

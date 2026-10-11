@@ -25,6 +25,7 @@ chrono.workspace = true
 humantime.workspace = true
 is-terminal.workspace = true
 whoami.workspace = true
+ctrlc.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

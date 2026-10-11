@@ -821,3 +821,49 @@ fn pointer_file_finds_a_collective_in_a_subdirectory() {
     let v: Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(v["collective"]["name"], "t");
 }
+
+#[cfg(unix)]
+#[test]
+fn sigterm_lets_the_running_turn_finish() {
+    let c = Coll::lanes();
+    c.profile("lane", "stages = [\"work\"]\n");
+    c.ok(&["agent", "add", "--name", "slowpoke", "--profile", "lane"]);
+    let id = c.add("lead", "takes a while", "slowpoke");
+    let child = c
+        .cmd()
+        .args(["fleet", "run", "--interval", "1s"])
+        .env("VFLT_BIN", VFLT)
+        .env("FAKE_AGENT_MODE", "slow")
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    // wait until the turn has started, then ask the fleet to stop
+    let start = std::time::Instant::now();
+    while c.show(&id)["status"] != "in_progress" {
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(20),
+            "turn never started"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    let pid = child.id().to_string();
+    assert!(Command::new("kill")
+        .args(["-TERM", &pid])
+        .status()
+        .unwrap()
+        .success());
+    let out = child.wait_with_output().unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(String::from_utf8_lossy(&out.stderr).contains("finishing the current turn"));
+    assert_eq!(c.show(&id)["status"], "done", "the turn completed its item");
+    let a = &c.json(&["agent", "list"])[0];
+    assert_eq!(
+        a["desired"], "running",
+        "a graceful stop leaves the control plane alone"
+    );
+    assert_eq!(a["status"], "offline");
+}

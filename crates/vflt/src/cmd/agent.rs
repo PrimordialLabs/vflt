@@ -71,7 +71,7 @@ pub fn run(ctx: &Ctx, cmd: AgentCmd) -> Result<()> {
                     interval,
                     runner,
                     prefix: String::new(),
-                    stop: Default::default(),
+                    stop: crate::shutdown::install(),
                 },
             )
         }

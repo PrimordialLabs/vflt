@@ -25,3 +25,4 @@ shlex = "1"
 whoami = "1"
 dirs = "6"
 rusqlite = { version = "0.32", features = ["bundled"] }
+ctrlc = { version = "3", features = ["termination"] }

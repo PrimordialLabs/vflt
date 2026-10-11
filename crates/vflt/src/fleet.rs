@@ -2,7 +2,6 @@
 //! thread each. Each thread is an ordinary agent loop; the process exits when
 //! every agent has stopped (`vflt agent stop --all`).
 
-use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -33,7 +32,7 @@ pub fn run(ctx: &Ctx, only: Vec<String>, interval: Duration, once: bool) -> Resu
         agents.len(),
         agents.join(", ")
     );
-    let stop = Arc::new(AtomicBool::new(false));
+    let stop = crate::shutdown::install();
     let failures: Vec<(String, anyhow::Error)> = std::thread::scope(|s| {
         let handles: Vec<_> = agents
             .iter()

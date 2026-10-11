@@ -4,8 +4,37 @@
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
 use std::process::{Command, Stdio};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
+
+/// Pids of children currently running, so an abort can stop them.
+fn live() -> &'static Mutex<Vec<u32>> {
+    static LIVE: OnceLock<Mutex<Vec<u32>>> = OnceLock::new();
+    LIVE.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+/// Kill every child this process is running (and, on Unix, its process
+/// group). For a second interrupt: the first one lets turns finish.
+pub fn abort_children() {
+    let pids: Vec<u32> = live().lock().map(|v| v.clone()).unwrap_or_default();
+    for pid in pids {
+        #[cfg(unix)]
+        {
+            let _ = Command::new("kill")
+                .args(["-TERM", &format!("-{pid}")])
+                .stderr(Stdio::null())
+                .status();
+        }
+        #[cfg(windows)]
+        {
+            let _ = Command::new("taskkill")
+                .args(["/T", "/F", "/PID", &pid.to_string()])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        }
+    }
+}
 
 use anyhow::{Context, Result};
 
@@ -37,9 +66,26 @@ pub fn run_capture(
     for (k, v) in env {
         cmd.env(k, v);
     }
+    // Its own process group: an interrupt aimed at the orchestrator (a
+    // terminal Ctrl-C) lets the turn finish instead of killing it.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        cmd.creation_flags(CREATE_NEW_PROCESS_GROUP);
+    }
     let mut child = cmd
         .spawn()
         .with_context(|| format!("failed to spawn {program}"))?;
+    let pid = child.id();
+    if let Ok(mut v) = live().lock() {
+        v.push(pid);
+    }
 
     let mut stdin = child.stdin.take().context("no stdin")?;
     let stdout = child.stdout.take().context("no stdout")?;
@@ -89,7 +135,11 @@ pub fn run_capture(
         lines.push(line);
     }
 
-    let status = child.lock().unwrap().wait().context("waiting for child")?;
+    let status = child.lock().unwrap().wait().context("waiting for child");
+    if let Ok(mut v) = live().lock() {
+        v.retain(|p| *p != pid);
+    }
+    let status = status?;
     let _ = writer.join();
     if let Some(w) = watchdog {
         let _ = w.join();
