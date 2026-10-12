@@ -225,6 +225,8 @@ batch       = 1
 permission_mode  = "auto"
 allowed_tools    = ["Read", "Edit", "Write", "Grep", "Glob", "Bash(git *)", "Bash(vflt *)"]
 disallowed_tools = ["Bash(rm -rf *)"]
+mcp_config       = ["mcp/base.json"]  # MCP servers for the turn, relative to the collective
+                                      # root; set means only these ([]: none)
 
 [policy.classifier]
 environment = ["Workspace is the item's checkout under the collective root."]
@@ -285,7 +287,9 @@ the orchestrator does not kill a turn.
 ## 7. Agent loop
 
 `vflt agent run --profile coder [--once] [--interval 15s] [--name <name>]`,
-or `vflt fleet run` for every registered local agent, a thread each.
+or `vflt fleet run [--max-parallel N]` for every registered local agent, a
+thread each; with a cap, the agents share N turn slots and an agent takes one
+after its gates pass and before it claims (status `waiting` while none is free).
 
 1. Register the agent (or resume by name). Release any item it still holds
    from a turn that never finished, with a note.

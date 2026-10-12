@@ -37,6 +37,57 @@ pub struct RunOptions {
     pub prefix: String,
     /// Set to ask the loop to finish its turn and return.
     pub stop: Arc<AtomicBool>,
+    /// Turn slots shared with the rest of the fleet (fleet mode with a cap).
+    pub slots: Option<Arc<TurnSlots>>,
+}
+
+/// A fleet-wide cap on turns running at once. An agent takes a slot after
+/// its gates pass and before it claims anything, and holds it for the turn.
+pub struct TurnSlots {
+    cap: usize,
+    used: std::sync::Mutex<usize>,
+}
+
+impl TurnSlots {
+    pub fn new(cap: usize) -> Arc<Self> {
+        Arc::new(TurnSlots {
+            cap: cap.max(1),
+            used: std::sync::Mutex::new(0),
+        })
+    }
+
+    pub fn cap(&self) -> usize {
+        self.cap
+    }
+
+    /// A slot if one is free; it is given back when the guard drops.
+    pub fn try_take(self: &Arc<Self>) -> Option<SlotGuard> {
+        let mut used = self.used.lock().unwrap_or_else(|e| e.into_inner());
+        if *used >= self.cap {
+            return None;
+        }
+        *used += 1;
+        Some(SlotGuard(Arc::clone(self)))
+    }
+}
+
+pub struct SlotGuard(Arc<TurnSlots>);
+
+impl Drop for SlotGuard {
+    fn drop(&mut self) {
+        let mut used = self.0.used.lock().unwrap_or_else(|e| e.into_inner());
+        *used = used.saturating_sub(1);
+    }
+}
+
+/// What one pass of the loop did.
+enum Pass {
+    /// A turn ran (or was attempted).
+    Ran,
+    /// Nothing to do, or held back by a gate.
+    Nothing,
+    /// Work is waiting, but every fleet turn slot is taken.
+    Waiting,
 }
 
 const HEARTBEAT_EVERY: Duration = Duration::from_secs(30);
@@ -229,10 +280,15 @@ fn work_loop(a: &Agentry) -> Result<()> {
             }
         };
         match iteration(a, &agent, &profile) {
-            Ok(Some(())) => {
+            Ok(Pass::Ran) => {
                 idle_logged = false;
             }
-            Ok(None) => {
+            Ok(Pass::Waiting) => {
+                // Even with --once: the turn is owed, just not yet.
+                a.nap(a.opts.interval.min(Duration::from_secs(5)));
+                continue;
+            }
+            Ok(Pass::Nothing) => {
                 if a.opts.once {
                     if !idle_logged {
                         a.log(format!("no claimable items for profile {}", profile.name));
@@ -257,9 +313,8 @@ fn work_loop(a: &Agentry) -> Result<()> {
     }
 }
 
-/// One pass: `Some(())` when a turn ran (or was attempted), `None` when there
-/// was nothing to do or the agent is held back.
-fn iteration(a: &Agentry, agent: &Agent, profile: &Profile) -> Result<Option<()>> {
+/// One pass of the loop: pick, gate, take a turn slot, claim, run.
+fn iteration(a: &Agentry, agent: &Agent, profile: &Profile) -> Result<Pass> {
     let store = a.store();
     let coll = store.collective()?;
     let items = store.list_items(&ItemFilter::default())?;
@@ -289,17 +344,35 @@ fn iteration(a: &Agentry, agent: &Agent, profile: &Profile) -> Result<Option<()>
             store.update_agent(&cfg, &a.me, &format!("{} had nothing to wake for", a.me))?;
         }
         a.set_status(AgentStatus::Idle, Some("no work".into()));
-        return Ok(None);
+        return Ok(Pass::Nothing);
     }
 
     if let Some(reason) = check_gates(a, profile)? {
         a.set_status(AgentStatus::Gated, Some(reason));
-        return Ok(None);
+        return Ok(Pass::Nothing);
     }
     if let Some(reason) = spend_cap(a, agent, profile)? {
         a.set_status(AgentStatus::Gated, Some(reason));
-        return Ok(None);
+        return Ok(Pass::Nothing);
     }
+    let _slot = match &a.opts.slots {
+        None => None,
+        Some(slots) => match slots.try_take() {
+            Some(guard) => Some(guard),
+            None => {
+                let what = if batch.is_empty() {
+                    "a cycle".to_string()
+                } else {
+                    format!("{} ready", batch.len())
+                };
+                a.set_status(
+                    AgentStatus::Waiting,
+                    Some(format!("{what}; all {} turn slots in use", slots.cap())),
+                );
+                return Ok(Pass::Waiting);
+            }
+        },
+    };
 
     if !batch.is_empty() {
         let mut claimed = Vec::new();
@@ -312,7 +385,7 @@ fn iteration(a: &Agentry, agent: &Agent, profile: &Profile) -> Result<Option<()>
             }
         }
         if claimed.is_empty() {
-            return Ok(Some(())); // lost every race; look again at once
+            return Ok(Pass::Ran); // lost every race; look again at once
         }
         // Work routed here by someone else wakes a snoozed cycle.
         if agent.runtime.snoozed.is_some()
@@ -326,7 +399,7 @@ fn iteration(a: &Agentry, agent: &Agent, profile: &Profile) -> Result<Option<()>
     } else if let Some(why) = cycle {
         cycle_turn(a, agent, profile, &items, why)?;
     }
-    Ok(Some(()))
+    Ok(Pass::Ran)
 }
 
 /// Why a cycle turn is due now, if it is.
@@ -392,6 +465,18 @@ fn base_dir(a: &Agentry, profile: &Profile) -> PathBuf {
         WorkspaceMode::Item => a.ctx.root.clone(),
         _ => resolve_dir(&a.ctx.root, &profile.workspace.dir),
     }
+}
+
+/// The profile's policy for one turn, with its MCP config files resolved
+/// against the collective root (the turn may run anywhere).
+fn turn_policy(a: &Agentry, profile: &Profile) -> vflt_core::profile::Policy {
+    let mut policy = profile.policy.clone();
+    if let Some(files) = policy.mcp_config.as_mut() {
+        for f in files.iter_mut() {
+            *f = resolve_dir(&a.ctx.root, f).to_string_lossy().into_owned();
+        }
+    }
+    policy
 }
 
 fn extra_dirs(a: &Agentry, profile: &Profile) -> Vec<PathBuf> {
@@ -683,7 +768,7 @@ fn item_turn(a: &Agentry, agent: &Agent, profile: &Profile, items: Vec<Item>) ->
         scratch_dir: scratch.clone(),
         extra_dirs: extra_dirs(a, profile),
         model: effective_model(agent, profile),
-        policy: profile.policy.clone(),
+        policy: turn_policy(a, profile),
         budget: effective_budget(agent, profile),
         env: env.clone(),
         log_path: Some(scratch.join("transcript.jsonl")),
@@ -920,7 +1005,7 @@ fn cycle_turn(
         scratch_dir: scratch.clone(),
         extra_dirs: extra_dirs(a, profile),
         model: effective_model(agent, profile),
-        policy: profile.policy.clone(),
+        policy: turn_policy(a, profile),
         budget: effective_budget(agent, profile),
         env,
         log_path: Some(scratch.join("transcript.jsonl")),

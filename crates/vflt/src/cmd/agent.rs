@@ -72,6 +72,7 @@ pub fn run(ctx: &Ctx, cmd: AgentCmd) -> Result<()> {
                     runner,
                     prefix: String::new(),
                     stop: crate::shutdown::install(),
+                    slots: None,
                 },
             )
         }
@@ -373,6 +374,7 @@ pub fn reading(
         ),
         AgentStatus::Paused => ("paused", format!("{} ready", q.ready)),
         AgentStatus::Gated => ("gated", agent.runtime.note.clone().unwrap_or_default()),
+        AgentStatus::Waiting => ("waiting", agent.runtime.note.clone().unwrap_or_default()),
         _ => {
             if agent.config.desired == Desired::Stopped {
                 ("stopping", String::new())

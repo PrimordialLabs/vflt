@@ -97,6 +97,13 @@ impl ClaudeRunner {
             a.push("--resume".into());
             a.push(s.clone());
         }
+        if let Some(files) = &req.policy.mcp_config {
+            a.push("--strict-mcp-config".into());
+            for f in files {
+                a.push("--mcp-config".into());
+                a.push(f.clone());
+            }
+        }
         a.extend(self.extra_args.iter().cloned());
         a
     }
@@ -264,6 +271,7 @@ mod tests {
                     soft_deny: vec!["s".into()],
                     hard_deny: vec!["h".into()],
                 },
+                mcp_config: None,
             },
             budget: Budget {
                 max_turns: 7,
@@ -301,6 +309,21 @@ mod tests {
         assert_eq!(settings["autoMode"]["soft_deny"][0], "s");
         assert_eq!(settings["autoMode"]["hard_deny"][0], "h");
         assert_eq!(settings["permissions"]["deny"][0], "Bash(rm -rf *)");
+    }
+
+    #[test]
+    fn mcp_config_loads_only_the_named_servers() {
+        let r = ClaudeRunner::default();
+        let a = r.argv(&req(), std::path::Path::new("sys.md"));
+        assert!(!a.contains(&"--strict-mcp-config".to_string()));
+        let mut q = req();
+        q.policy.mcp_config = Some(vec!["/c/base.json".into(), "/c/ui.json".into()]);
+        let s = r.argv(&q, std::path::Path::new("sys.md")).join(" ");
+        assert!(s.contains("--strict-mcp-config --mcp-config /c/base.json --mcp-config /c/ui.json"));
+        q.policy.mcp_config = Some(vec![]);
+        let a = r.argv(&q, std::path::Path::new("sys.md"));
+        assert!(a.contains(&"--strict-mcp-config".to_string()));
+        assert!(!a.contains(&"--mcp-config".to_string()));
     }
 
     #[test]

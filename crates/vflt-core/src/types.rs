@@ -578,6 +578,8 @@ pub enum AgentStatus {
     Paused,
     /// Up, but a gate hook or spend cap is holding it back.
     Gated,
+    /// Up, with work, waiting for one of the fleet's turn slots.
+    Waiting,
     #[default]
     Offline,
 }
@@ -589,6 +591,7 @@ impl AgentStatus {
             AgentStatus::Idle => "idle",
             AgentStatus::Paused => "paused",
             AgentStatus::Gated => "gated",
+            AgentStatus::Waiting => "waiting",
             AgentStatus::Offline => "offline",
         }
     }

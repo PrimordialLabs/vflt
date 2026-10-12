@@ -812,6 +812,50 @@ fn fleet_runs_every_local_agent_and_costs_add_up() {
 }
 
 #[test]
+fn max_parallel_runs_turns_one_after_another() {
+    let c = Coll::lanes();
+    c.profile("lane", "stages = [\"work\"]\n");
+    let mut ids = Vec::new();
+    for n in ["s1", "s2"] {
+        c.ok(&["agent", "add", "--name", n, "--profile", "lane"]);
+        ids.push(c.add("lead", &format!("for {n}"), n));
+    }
+    let out = c
+        .cmd()
+        .args(["fleet", "run", "--once", "--max-parallel", "1"])
+        .env("VFLT_BIN", VFLT)
+        .env("FAKE_AGENT_MODE", "slow")
+        .output()
+        .unwrap();
+    ok(&out);
+    assert!(String::from_utf8_lossy(&out.stderr).contains("at most 1 turns at once"));
+    // each turn runs from its start to its run record; with one slot the
+    // spans must not overlap
+    let mut spans: Vec<(String, String)> = ids
+        .iter()
+        .map(|id| {
+            let d = c.json(&["item", "show", id, "--events"]);
+            assert_eq!(d["status"], "done");
+            let ev = d["events"].as_array().unwrap();
+            let at = |kind: &str| {
+                ev.iter()
+                    .find(|e| e["kind"] == kind)
+                    .unwrap_or_else(|| panic!("{id} has no {kind}"))["ts"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            };
+            (at("item.started"), at("agent.run"))
+        })
+        .collect();
+    spans.sort();
+    assert!(
+        spans[1].0 >= spans[0].1,
+        "turns overlapped under --max-parallel 1: {spans:?}"
+    );
+}
+
+#[test]
 fn pointer_file_finds_a_collective_in_a_subdirectory() {
     let c = Coll::lanes();
     let repo = c.tmp.path();

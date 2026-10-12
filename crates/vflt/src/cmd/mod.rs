@@ -355,10 +355,11 @@ fn fleet(ctx: &Ctx, cmd: FleetCmd) -> Result<()> {
             only,
             interval,
             once,
+            max_parallel,
         } => {
             let interval = humantime::parse_duration(&interval)
                 .with_context(|| format!("--interval {interval:?}"))?;
-            crate::fleet::run(ctx, only, interval, once)
+            crate::fleet::run(ctx, only, interval, once, max_parallel)
         }
     }
 }

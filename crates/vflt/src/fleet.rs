@@ -1,6 +1,8 @@
 //! `vflt fleet run`: every local agent of the collective in one process, one
 //! thread each. Each thread is an ordinary agent loop; the process exits when
-//! every agent has stopped (`vflt agent stop --all`).
+//! every agent has stopped (`vflt agent stop --all`). With `--max-parallel`,
+//! the agents share that many turn slots, so a fleet larger than its machine
+//! takes turns instead of running them all at once.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -8,10 +10,16 @@ use std::time::Duration;
 use anyhow::{bail, Result};
 use vflt_core::AgentKind;
 
-use crate::agent_loop::{self, RunOptions};
+use crate::agent_loop::{self, RunOptions, TurnSlots};
 use crate::ctx::Ctx;
 
-pub fn run(ctx: &Ctx, only: Vec<String>, interval: Duration, once: bool) -> Result<()> {
+pub fn run(
+    ctx: &Ctx,
+    only: Vec<String>,
+    interval: Duration,
+    once: bool,
+    max_parallel: usize,
+) -> Result<()> {
     let agents: Vec<String> = ctx
         .store()
         .list_agents()?
@@ -27,9 +35,14 @@ pub fn run(ctx: &Ctx, only: Vec<String>, interval: Duration, once: bool) -> Resu
         );
     }
     let width = agents.iter().map(|n| n.len()).max().unwrap_or(0);
+    let slots = (max_parallel > 0).then(|| TurnSlots::new(max_parallel));
     vflt_core::log_line(&format!(
-        "vflt: fleet of {} agents: {}",
+        "vflt: fleet of {} agents{}: {}",
         agents.len(),
+        slots
+            .as_ref()
+            .map(|s| format!(", at most {} turns at once", s.cap()))
+            .unwrap_or_default(),
         agents.join(", ")
     ));
     let stop = crate::shutdown::install();
@@ -39,6 +52,7 @@ pub fn run(ctx: &Ctx, only: Vec<String>, interval: Duration, once: bool) -> Resu
             .enumerate()
             .map(|(n, name)| {
                 let stop = Arc::clone(&stop);
+                let slots = slots.clone();
                 let name = name.clone();
                 s.spawn(move || {
                     // Stagger starts so first turns do not all hit the runner at once.
@@ -51,6 +65,7 @@ pub fn run(ctx: &Ctx, only: Vec<String>, interval: Duration, once: bool) -> Resu
                         runner: None,
                         prefix: format!(" [{name:<width$}]"),
                         stop,
+                        slots,
                     };
                     (name, agent_loop::run(ctx, opts))
                 })

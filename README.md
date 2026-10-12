@@ -163,6 +163,7 @@ batch   = 1          # items per turn
 permission_mode  = "auto"
 allowed_tools    = ["Read", "Edit", "Bash(git *)", "Bash(vflt *)"]
 disallowed_tools = ["Bash(rm -rf *)"]
+mcp_config       = ["mcp/base.json"]   # only these MCP servers (unset: runner default)
 
 [policy.classifier]       # advisory rules for the runner's permission classifier
 environment = ["Workspace is the item's checkout under the collective root."]
@@ -234,7 +235,9 @@ one.
 `vflt fleet run` runs every registered local agent in one process, a thread
 each. Interrupt it (Ctrl-C, SIGTERM) and every agent finishes its current turn
 and exits, with its control plane untouched; interrupt again to abort the
-running turns.
+running turns. `--max-parallel N` shares N turn slots across the fleet: an
+agent with work takes a slot before it claims anything and reads `waiting`
+until one frees, so a fleet larger than its machine takes turns.
 
 ## Runners
 

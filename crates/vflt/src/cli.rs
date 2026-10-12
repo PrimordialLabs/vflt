@@ -495,5 +495,9 @@ pub enum FleetCmd {
         /// Each agent works one item (or one cycle) and exits
         #[arg(long)]
         once: bool,
+        /// Run at most this many turns at once across the fleet (0: no cap);
+        /// agents with work wait for a free slot before claiming it
+        #[arg(long, default_value_t = 0)]
+        max_parallel: usize,
     },
 }

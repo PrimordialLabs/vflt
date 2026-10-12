@@ -96,6 +96,12 @@ pub struct Policy {
     pub disallowed_tools: Vec<String>,
     #[serde(default)]
     pub classifier: Classifier,
+    /// MCP server config files (JSON with an `mcpServers` map) for this
+    /// profile's turns, relative to the collective root. Unset, the runner
+    /// loads whatever servers it would by default; set, it loads only these
+    /// (an empty list: none). Runners without MCP support ignore it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp_config: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
