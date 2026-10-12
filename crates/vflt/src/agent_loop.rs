@@ -98,6 +98,40 @@ struct Agentry<'a> {
     me: ActorId,
     profile_name: String,
     opts: &'a RunOptions,
+    /// While the runner fails before doing any work: no turn starts before
+    /// the instant, and the wait doubles with each failure.
+    fault: std::sync::Mutex<Option<Backoff>>,
+}
+
+#[derive(Debug, Clone)]
+struct Backoff {
+    until: Instant,
+    wait: Duration,
+    why: String,
+}
+
+const FAULT_FIRST_WAIT: Duration = Duration::from_secs(60);
+const FAULT_MAX_WAIT: Duration = Duration::from_secs(15 * 60);
+
+impl Backoff {
+    fn after(prev: Option<&Backoff>, why: String) -> Backoff {
+        let wait = prev
+            .map(|b| (b.wait * 2).min(FAULT_MAX_WAIT))
+            .unwrap_or(FAULT_FIRST_WAIT);
+        Backoff {
+            until: Instant::now() + wait,
+            wait,
+            why,
+        }
+    }
+}
+
+/// A runner that reports an error and a cost of exactly nothing never
+/// completed a model call, so it did no work: the fault is the runner's
+/// (credentials, quota, a broken install), not the item's. Runners that do
+/// not report cost are never judged this way.
+fn runner_fault(o: &RunOutcome) -> bool {
+    o.is_error && !o.timed_out && o.exit_code != 0 && o.cost_usd == Some(0.0)
 }
 
 impl Agentry<'_> {
@@ -107,6 +141,25 @@ impl Agentry<'_> {
 
     fn log(&self, msg: impl AsRef<str>) {
         vflt_core::log_line(&format!("vflt{}: {}", self.opts.prefix, msg.as_ref()));
+    }
+
+    /// Record a runner fault; returns how long the agent now waits.
+    fn runner_failed(&self, why: &str) -> Duration {
+        let mut f = self.fault.lock().unwrap_or_else(|e| e.into_inner());
+        let next = Backoff::after(f.as_ref(), why.to_string());
+        let wait = next.wait;
+        *f = Some(next);
+        wait
+    }
+
+    fn runner_worked(&self) {
+        *self.fault.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+
+    /// The pending backoff, while it lasts.
+    fn backing_off(&self) -> Option<Backoff> {
+        let f = self.fault.lock().unwrap_or_else(|e| e.into_inner());
+        f.as_ref().filter(|b| Instant::now() < b.until).cloned()
     }
 
     /// Update the runtime record, keeping what the closure does not touch.
@@ -193,6 +246,7 @@ pub fn run(ctx: &Ctx, opts: RunOptions) -> Result<()> {
         me: me.clone(),
         profile_name,
         opts: &opts,
+        fault: std::sync::Mutex::new(None),
     };
     a.log(format!(
         "agent {} running profile {} with runner {} on collective {} ({})",
@@ -347,6 +401,17 @@ fn iteration(a: &Agentry, agent: &Agent, profile: &Profile) -> Result<Pass> {
         return Ok(Pass::Nothing);
     }
 
+    if let Some(b) = a.backing_off() {
+        a.set_status(
+            AgentStatus::Gated,
+            Some(format!(
+                "runner failing ({}); next try in {}s",
+                b.why,
+                b.until.saturating_duration_since(Instant::now()).as_secs()
+            )),
+        );
+        return Ok(Pass::Nothing);
+    }
     if let Some(reason) = check_gates(a, profile)? {
         a.set_status(AgentStatus::Gated, Some(reason));
         return Ok(Pass::Nothing);
@@ -807,6 +872,33 @@ fn item_turn(a: &Agentry, agent: &Agent, profile: &Profile, items: Vec<Item>) ->
             .unwrap_or_else(|| "n/a".into())
     ));
 
+    if runner_fault(&outcome) {
+        let why = first_line(&outcome.result_text);
+        let wait = a.runner_failed(&why);
+        a.log(format!(
+            "runner fault on {} ({why}): released; next try in {}s",
+            ids.join(", "),
+            wait.as_secs()
+        ));
+        for it in &items {
+            store.add_note(
+                it.id(),
+                &a.me,
+                &format!(
+                    "Turn did no work: the runner failed before its first model call ({why}). \
+                     Released back to pending; the agent tries again after a backoff."
+                ),
+            )?;
+            store.release(it.id(), &a.me)?;
+        }
+        for h in &profile.hooks.after {
+            let _ = run_hook(h, &ws, &env);
+        }
+        a.set_status(AgentStatus::Gated, Some(format!("runner failing: {why}")));
+        return Ok(());
+    }
+    a.runner_worked();
+
     let mut after_failure: Option<String> = None;
     for h in &profile.hooks.after {
         let (code, out) = run_hook(h, &ws, &env)?;
@@ -1012,6 +1104,17 @@ fn cycle_turn(
         session: None,
     };
     let o = run_with_heartbeat(a, runner.as_ref(), req)?;
+    if runner_fault(&o) {
+        let why = first_line(&o.result_text);
+        let wait = a.runner_failed(&why);
+        a.log(format!(
+            "runner fault on a cycle turn ({why}); next try in {}s",
+            wait.as_secs()
+        ));
+        a.set_status(AgentStatus::Gated, Some(format!("runner failing: {why}")));
+        return Ok(());
+    }
+    a.runner_worked();
     store.append_event(
         Event::new(
             &a.me,
@@ -1039,4 +1142,42 @@ fn cycle_turn(
         Some(format!("cycle: {}", first_line(&o.result_text))),
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn outcome(exit: i32, cost: Option<f64>, is_error: bool, timed_out: bool) -> RunOutcome {
+        RunOutcome {
+            exit_code: exit,
+            cost_usd: cost,
+            is_error,
+            timed_out,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_runner_fault_is_an_error_that_cost_nothing() {
+        assert!(runner_fault(&outcome(1, Some(0.0), true, false)));
+        // it did some work: the item's problem, not the runner's
+        assert!(!runner_fault(&outcome(1, Some(0.02), true, false)));
+        // runners that report no cost are never judged this way
+        assert!(!runner_fault(&outcome(1, None, true, false)));
+        // a wall-clock kill is the item's budget, not a runner fault
+        assert!(!runner_fault(&outcome(124, Some(0.0), true, true)));
+        assert!(!runner_fault(&outcome(0, Some(0.0), false, false)));
+    }
+
+    #[test]
+    fn backoff_doubles_up_to_its_cap() {
+        let first = Backoff::after(None, "x".into());
+        assert_eq!(first.wait, FAULT_FIRST_WAIT);
+        let mut b = first;
+        for _ in 0..10 {
+            b = Backoff::after(Some(&b), "x".into());
+        }
+        assert_eq!(b.wait, FAULT_MAX_WAIT);
+    }
 }

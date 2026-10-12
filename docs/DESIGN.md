@@ -301,15 +301,20 @@ after its gates pass and before it claims (status `waiting` while none is free).
    agent filed. Lowest priority number first, then oldest.
 4. Nothing selected: run a cycle turn if one is due, else idle.
 5. Something to do: run the `gate` hooks and check the daily spend cap; a
-   failure holds the agent (`gated`) without claiming.
+   failure holds the agent (`gated`) without claiming. In a capped fleet,
+   take a turn slot (`waiting` until one frees).
 6. Claim and start the batch; work routed by someone else clears a snooze.
    Prepare the workspace, run `before` hooks, launch the runner with a
    heartbeat thread alongside, run `after` hooks.
 7. Record an `agent.run` event per item (exit, turns, cost share,
    transcript). Any item the turn left in progress is raised with the
-   transcript tail.
+   transcript tail. A runner that errors at zero cost never completed a
+   model call (credentials, quota, a broken install): its items are released
+   back to pending with a note instead, and the agent stays `gated` for a
+   backoff (1 minute, doubling to 15) before it tries again, so a fleet-wide
+   outage parks nothing on a human.
 
-Runtime status (`active`, `idle`, `paused`, `gated`, `offline`), the current
+Runtime status (`active`, `idle`, `paused`, `gated`, `waiting`, `offline`), the current
 items and a one-line note are written as the agent goes, for `agent list`
 and panels.
 
