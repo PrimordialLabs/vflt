@@ -61,6 +61,10 @@ pub struct PermissionDenial {
     pub reason: Option<String>,
     #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
     pub input: serde_json::Value,
+    /// The check gave no verdict (it was unavailable): a transient outage of
+    /// the check, not a judgment about the action.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub no_verdict: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

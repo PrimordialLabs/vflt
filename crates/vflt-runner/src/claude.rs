@@ -150,6 +150,7 @@ impl Runner for ClaudeRunner {
 
         let mut outcome = RunOutcome::default();
         let mut assistant_lines: Vec<String> = Vec::new();
+        let mut reasons = DenialReasons::new();
         let captured = run_capture(
             &argv,
             &req.cwd,
@@ -162,7 +163,7 @@ impl Runner for ClaudeRunner {
                     let _ = writeln!(f, "{line}");
                 }
                 if let Ok(v) = serde_json::from_str::<Value>(line) {
-                    absorb_event(&v, &mut outcome, &mut assistant_lines);
+                    absorb_event(&v, &mut outcome, &mut assistant_lines, &mut reasons);
                 }
             },
         )?;
@@ -181,9 +182,32 @@ impl Runner for ClaudeRunner {
     }
 }
 
+/// Why each denied tool call was denied, by tool_use_id: the stream reports
+/// each denial as it happens (with its reason), the result only lists them.
+type DenialReasons = std::collections::HashMap<String, String>;
+
+/// Claude Code's reason when the permission classifier could not be reached:
+/// the check gave no verdict, so the denial says nothing about the action.
+fn gave_no_verdict(reason: &str) -> bool {
+    reason.to_ascii_lowercase().contains("unavailable")
+}
+
 /// Fold one stream-json event into the outcome.
-fn absorb_event(v: &Value, out: &mut RunOutcome, assistant_lines: &mut Vec<String>) {
+fn absorb_event(
+    v: &Value,
+    out: &mut RunOutcome,
+    assistant_lines: &mut Vec<String>,
+    reasons: &mut DenialReasons,
+) {
     match v.get("type").and_then(Value::as_str) {
+        Some("system") if v.get("subtype").and_then(Value::as_str) == Some("permission_denied") => {
+            if let (Some(id), Some(r)) = (
+                v.get("tool_use_id").and_then(Value::as_str),
+                v.get("decision_reason").and_then(Value::as_str),
+            ) {
+                reasons.insert(id.to_string(), r.to_string());
+            }
+        }
         Some("result") => {
             if let Some(t) = v.get("result").and_then(Value::as_str) {
                 out.result_text = t.to_string();
@@ -197,6 +221,15 @@ fn absorb_event(v: &Value, out: &mut RunOutcome, assistant_lines: &mut Vec<Strin
             out.is_error = v.get("is_error").and_then(Value::as_bool).unwrap_or(false);
             if let Some(arr) = v.get("permission_denials").and_then(Value::as_array) {
                 for d in arr {
+                    let reason = d
+                        .get("reason")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                        .or_else(|| {
+                            d.get("tool_use_id")
+                                .and_then(Value::as_str)
+                                .and_then(|id| reasons.get(id).cloned())
+                        });
                     out.permission_denials.push(PermissionDenial {
                         tool: d
                             .get("tool_name")
@@ -204,20 +237,23 @@ fn absorb_event(v: &Value, out: &mut RunOutcome, assistant_lines: &mut Vec<Strin
                             .and_then(Value::as_str)
                             .unwrap_or("unknown")
                             .to_string(),
-                        reason: d.get("reason").and_then(Value::as_str).map(str::to_string),
+                        no_verdict: reason.as_deref().is_some_and(gave_no_verdict),
+                        reason,
                         input: d.get("tool_input").cloned().unwrap_or(Value::Null),
                     });
                 }
             }
         }
         Some("permission_denied") => {
+            let reason = v.get("reason").and_then(Value::as_str).map(str::to_string);
             out.permission_denials.push(PermissionDenial {
                 tool: v
                     .get("tool")
                     .and_then(Value::as_str)
                     .unwrap_or("unknown")
                     .to_string(),
-                reason: v.get("reason").and_then(Value::as_str).map(str::to_string),
+                no_verdict: reason.as_deref().is_some_and(gave_no_verdict),
+                reason,
                 input: v.get("input").cloned().unwrap_or(Value::Null),
             });
         }
@@ -342,16 +378,19 @@ mod tests {
     fn result_event_is_absorbed() {
         let mut out = RunOutcome::default();
         let mut lines = vec![];
+        let mut reasons = DenialReasons::new();
         absorb_event(
             &json!({"type":"assistant","message":{"content":[{"type":"text","text":"hi\nthere"},{"type":"tool_use","name":"Bash","input":{"command":"vflt board"}}]}}),
             &mut out,
             &mut lines,
+            &mut reasons,
         );
         absorb_event(
             &json!({"type":"result","result":"done","session_id":"s1","total_cost_usd":0.12,"num_turns":3,"is_error":false,
                      "permission_denials":[{"tool_name":"Bash","tool_input":{"command":"rm -rf /"}}]}),
             &mut out,
             &mut lines,
+            &mut reasons,
         );
         assert_eq!(out.result_text, "done");
         assert_eq!(out.session_id.as_deref(), Some("s1"));
@@ -359,7 +398,44 @@ mod tests {
         assert_eq!(out.num_turns, Some(3));
         assert_eq!(out.permission_denials.len(), 1);
         assert_eq!(out.permission_denials[0].tool, "Bash");
+        assert!(!out.permission_denials[0].no_verdict);
         assert_eq!(lines.len(), 3);
         assert!(lines[2].starts_with("[tool_use Bash]"));
+    }
+
+    #[test]
+    fn a_denial_without_a_verdict_is_told_apart_from_a_judgment() {
+        let mut out = RunOutcome::default();
+        let mut lines = vec![];
+        let mut reasons = DenialReasons::new();
+        for (id, why) in [
+            ("t1", "Classifier unavailable"),
+            ("t2", "Blocked by policy"),
+        ] {
+            absorb_event(
+                &json!({"type":"system","subtype":"permission_denied","tool_name":"Bash","tool_use_id":id,
+                         "decision_reason_type":"classifier","decision_reason":why}),
+                &mut out,
+                &mut lines,
+                &mut reasons,
+            );
+        }
+        assert!(
+            out.permission_denials.is_empty(),
+            "the result lists them once"
+        );
+        absorb_event(
+            &json!({"type":"result","result":"done","is_error":false,"permission_denials":[
+                {"tool_name":"Bash","tool_use_id":"t1","tool_input":{"command":"vflt item handoff vf-1"}},
+                {"tool_name":"Bash","tool_use_id":"t2","tool_input":{"command":"rm -rf /"}}]}),
+            &mut out,
+            &mut lines,
+            &mut reasons,
+        );
+        let d = &out.permission_denials;
+        assert_eq!(d[0].reason.as_deref(), Some("Classifier unavailable"));
+        assert!(d[0].no_verdict);
+        assert_eq!(d[1].reason.as_deref(), Some("Blocked by policy"));
+        assert!(!d[1].no_verdict);
     }
 }

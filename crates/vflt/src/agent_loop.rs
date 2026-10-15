@@ -134,6 +134,107 @@ fn runner_fault(o: &RunOutcome) -> bool {
     o.is_error && !o.timed_out && o.exit_code != 0 && o.cost_usd == Some(0.0)
 }
 
+/// How a turn that left its item unfinished was cut short when the cause is
+/// the turn's circumstances, not the item: nothing for a human to decide, so
+/// the item goes back to its agent and the next turn resumes it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CutShort {
+    /// Every denial was the permission check giving no verdict (an outage of
+    /// the check), never a judgment about an action.
+    NoVerdict,
+    /// The wall-clock budget ran out with nothing denied.
+    WallClock,
+}
+
+/// Every note releasing an item after a cut-short turn starts with this.
+const CUT_SHORT: &str = "Turn cut short";
+
+impl CutShort {
+    fn why(self) -> &'static str {
+        match self {
+            CutShort::NoVerdict => "the permission check was unavailable",
+            CutShort::WallClock => "wall-clock budget exceeded",
+        }
+    }
+}
+
+fn cut_short(o: &RunOutcome) -> Option<CutShort> {
+    let d = &o.permission_denials;
+    if !d.is_empty() && d.iter().all(|d| d.no_verdict) {
+        Some(CutShort::NoVerdict)
+    } else if o.timed_out && d.is_empty() {
+        Some(CutShort::WallClock)
+    } else {
+        None
+    }
+}
+
+/// The directory private to one turn, exported under the profile's
+/// `workspace.turn_tmp` names and removed when the turn ends, however it
+/// ends. A tool killed mid-turn (a wall-clock limit, a timed-out shell call)
+/// never removes its temporary files; this does it for it.
+struct TurnTmp(Option<PathBuf>);
+
+impl TurnTmp {
+    /// One directory per agent under `base`: an agent runs one turn at a
+    /// time, so anything already there was left by a turn that never reached
+    /// its end (a killed fleet, a crash) and is removed first.
+    fn new(base: &Path, collective: &str, agent: &str, names: &[String]) -> Result<TurnTmp> {
+        if names.is_empty() {
+            return Ok(TurnTmp(None));
+        }
+        let slug = |s: &str| s.replace(['/', '\\', ' '], "_");
+        let dir = base
+            .join(format!("vflt-{}", slug(collective)))
+            .join(slug(agent));
+        if dir.exists() {
+            std::fs::remove_dir_all(&dir)?;
+        }
+        std::fs::create_dir_all(&dir)?;
+        Ok(TurnTmp(Some(dir)))
+    }
+
+    /// Point each of `names` at the directory.
+    fn export(&self, names: &[String], env: &mut Vec<(String, String)>) {
+        if let Some(dir) = &self.0 {
+            for n in names {
+                env.push((n.clone(), dir.to_string_lossy().into_owned()));
+            }
+        }
+    }
+}
+
+impl Drop for TurnTmp {
+    fn drop(&mut self) {
+        if let Some(dir) = &self.0 {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+}
+
+/// The turn's private directory, or none (logged) when it cannot be made:
+/// the turn then runs with the variables unset rather than not at all.
+fn turn_tmp(
+    a: &Agentry,
+    collective: &str,
+    profile: &Profile,
+    env: &mut Vec<(String, String)>,
+) -> TurnTmp {
+    let names = &profile.workspace.turn_tmp;
+    match TurnTmp::new(&std::env::temp_dir(), collective, a.me.as_str(), names) {
+        Ok(t) => {
+            t.export(names, env);
+            t
+        }
+        Err(e) => {
+            a.log(format!(
+                "turn temp dir not prepared ({e:#}); running without it"
+            ));
+            TurnTmp(None)
+        }
+    }
+}
+
 impl Agentry<'_> {
     fn store(&self) -> &dyn Store {
         self.ctx.store()
@@ -794,6 +895,7 @@ fn item_turn(a: &Agentry, agent: &Agent, profile: &Profile, items: Vec<Item>) ->
     env.push(("VFLT_ITEM".into(), ids[0].clone()));
     env.push(("VFLT_ITEMS".into(), ids.join(",")));
     env.push(("VFLT_WORKSPACE".into(), ws.to_string_lossy().into_owned()));
+    let _turn_tmp = turn_tmp(a, &coll.name, profile, &mut env);
 
     for h in &profile.hooks.before {
         let (code, out) = run_hook(h, &ws, &env)?;
@@ -922,6 +1024,20 @@ fn item_turn(a: &Agentry, agent: &Agent, profile: &Profile, items: Vec<Item>) ->
             &scratch,
         )?;
     }
+    if cut_short(&outcome) == Some(CutShort::NoVerdict) {
+        // The check is down for every agent: wait it out rather than spend
+        // turns that cannot act.
+        let why = CutShort::NoVerdict.why();
+        let wait = a.runner_failed(why);
+        a.log(format!(
+            "{} cut short on {} ({why}): released; next try in {}s",
+            a.me,
+            ids.join(", "),
+            wait.as_secs()
+        ));
+        a.set_status(AgentStatus::Gated, Some(format!("runner failing: {why}")));
+        return Ok(());
+    }
     a.set_status(
         AgentStatus::Idle,
         Some(format!(
@@ -989,7 +1105,11 @@ fn record_outcome(
         store.add_note(item.id(), &a.me, text)?;
     }
     if !o.permission_denials.is_empty() {
-        let mut body = String::from("The runner's permission classifier denied these actions:\n\n");
+        let mut body = String::from(if o.permission_denials.iter().all(|d| d.no_verdict) {
+            "The runner's permission check gave no verdict (it was unavailable) on these actions:\n\n"
+        } else {
+            "The runner's permission classifier denied these actions:\n\n"
+        });
         for d in &o.permission_denials {
             body.push_str(&format!(
                 "- {}{}: {}\n",
@@ -1011,7 +1131,14 @@ fn record_outcome(
         return Ok(());
     }
 
-    // The agent exited without finishing this item: leave evidence and raise.
+    // The agent exited without finishing this item: leave evidence, then
+    // release it for the next turn when the turn was cut short through no
+    // fault of the item's, else raise.
+    let cut = cut_short(o);
+    let resumed_before = store
+        .notes(item.id())?
+        .iter()
+        .any(|n| n.actor == a.me && n.body.starts_with(CUT_SHORT));
     let mut body = format!(
         "Runner `{}` exited (code {}{}{}) without completing, bouncing, parking, handing off, blocking or raising this item.\n\n",
         runner.name(),
@@ -1030,13 +1157,29 @@ fn record_outcome(
         body.push('\n');
     }
     store.add_note(item.id(), &a.me, &body)?;
+    // An unavailable check repeats nothing about the item, so it resumes
+    // every time (the agent backs off meanwhile); a turn that ran out of
+    // time resumes once, and a second one asks a human.
+    if let Some(cut) = cut.filter(|c| *c == CutShort::NoVerdict || !resumed_before) {
+        store.add_note(
+            item.id(),
+            &a.me,
+            &format!(
+                "{CUT_SHORT} ({}): released back to pending; the next turn resumes it from \
+                 these notes and the work already done.",
+                cut.why()
+            ),
+        )?;
+        store.release(item.id(), &a.me)?;
+        return Ok(());
+    }
     let question = if !o.permission_denials.is_empty() {
         format!(
             "runner was denied {} action(s) by the permission policy and did not finish; see notes",
             o.permission_denials.len()
         )
     } else if o.timed_out {
-        "runner exceeded its wall-clock budget without finishing; see notes".to_string()
+        "runner exceeded its wall-clock budget again without finishing; see notes".to_string()
     } else {
         format!(
             "runner exited with code {} without finishing; see notes",
@@ -1090,6 +1233,7 @@ fn cycle_turn(
     let runner = runner_for(a, profile)?;
     let mut env = base_env(a, profile);
     env.push(("VFLT_WORKSPACE".into(), ws.to_string_lossy().into_owned()));
+    let _turn_tmp = turn_tmp(a, &coll.name, profile, &mut env);
     let req = RunRequest {
         system_prompt: prompt::system_prompt(profile, &coll, &root, a.me.as_str(), &[]),
         prompt: prompt::cycle_prompt(items, &coll, agent, profile),
@@ -1147,6 +1291,64 @@ fn cycle_turn(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_turn_cut_short_by_its_circumstances_is_told_apart() {
+        let denial = |no_verdict| vflt_runner::PermissionDenial {
+            tool: "Bash".into(),
+            reason: None,
+            input: serde_json::Value::Null,
+            no_verdict,
+        };
+        let mut o = outcome(0, Some(1.0), false, false);
+        o.permission_denials = vec![denial(true), denial(true)];
+        assert_eq!(cut_short(&o), Some(CutShort::NoVerdict));
+        o.permission_denials.push(denial(false));
+        assert_eq!(cut_short(&o), None, "a real judgment is a human's to read");
+
+        let mut t = outcome(124, Some(3.0), true, true);
+        assert_eq!(cut_short(&t), Some(CutShort::WallClock));
+        t.permission_denials = vec![denial(false)];
+        assert_eq!(cut_short(&t), None);
+        assert_eq!(cut_short(&outcome(0, Some(1.0), false, false)), None);
+    }
+
+    #[test]
+    fn a_turns_temp_dir_is_exported_and_removed_when_the_turn_ends() {
+        let base = tempfile::tempdir().unwrap();
+        let names = vec!["TMPDIR".to_string(), "GOTMPDIR".to_string()];
+        let mut env = Vec::new();
+        let dir = {
+            let t = TurnTmp::new(base.path(), "coll", "agent-a", &names).unwrap();
+            t.export(&names, &mut env);
+            let dir = t.0.clone().unwrap();
+            std::fs::write(dir.join("left-by-a-killed-tool"), b"x").unwrap();
+            dir
+        };
+        assert_eq!(env.len(), 2);
+        assert!(env.iter().all(|(_, v)| Path::new(v) == dir));
+        assert!(!dir.exists(), "dropped with the turn");
+    }
+
+    #[test]
+    fn a_turns_temp_dir_starts_empty_and_is_skipped_without_names() {
+        let base = tempfile::tempdir().unwrap();
+        let names = vec!["TMPDIR".to_string()];
+        let orphan = base.path().join("vflt-coll").join("agent-a");
+        std::fs::create_dir_all(orphan.join("from-a-crashed-turn")).unwrap();
+        let sibling = base.path().join("vflt-coll").join("agent-ab");
+        std::fs::create_dir_all(&sibling).unwrap();
+        let t = TurnTmp::new(base.path(), "coll", "agent-a", &names).unwrap();
+        assert!(t.0.as_ref().unwrap().read_dir().unwrap().next().is_none());
+        assert!(sibling.exists(), "another agent's dir is not touched");
+        drop(t);
+
+        let none = TurnTmp::new(base.path(), "coll", "agent-a", &[]).unwrap();
+        assert!(none.0.is_none());
+        let mut env = Vec::new();
+        none.export(&[], &mut env);
+        assert!(env.is_empty());
+    }
 
     fn outcome(exit: i32, cost: Option<f64>, is_error: bool, timed_out: bool) -> RunOutcome {
         RunOutcome {

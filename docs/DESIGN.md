@@ -243,6 +243,8 @@ daily_usd  = 20.0
 mode     = "item"                # item | shared | worktree
 dir      = ""
 add_dirs = []
+turn_tmp = []                    # env vars set to a dir private to the turn,
+                                 # removed when the turn ends
 
 [hooks]
 gate   = []
@@ -312,7 +314,15 @@ after its gates pass and before it claims (status `waiting` while none is free).
    model call (credentials, quota, a broken install): its items are released
    back to pending with a note instead, and the agent stays `gated` for a
    backoff (1 minute, doubling to 15) before it tries again, so a fleet-wide
-   outage parks nothing on a human.
+   outage parks nothing on a human. A turn **cut short** by its
+   circumstances is released the same way, with a `Turn cut short` note,
+   for the next turn to resume: when every denial was the permission check
+   giving no verdict (an outage of the check, never a judgment; the agent
+   also backs off), or when the wall-clock budget ran out with nothing
+   denied (once per item; a second time is raised).
+8. With `workspace.turn_tmp` set, the turn gets a directory of its own,
+   exported under those variable names and removed when the turn ends, so
+   temporary files left by tools killed mid-turn go with it.
 
 Runtime status (`active`, `idle`, `paused`, `gated`, `waiting`, `offline`), the current
 items and a one-line note are written as the agent goes, for `agent list`

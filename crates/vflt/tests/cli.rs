@@ -480,6 +480,17 @@ fn wall_clock_budget_kills_a_hung_runner() {
         start.elapsed() < std::time::Duration::from_secs(20),
         "runner was not killed in time"
     );
+    // Running out of time cuts the turn short; it is not the item's fault, so
+    // the item goes back to pending for the next turn to resume.
+    let item = c.json(&["item", "show", &id]);
+    assert_eq!(item["status"], "pending");
+    assert!(c
+        .ok(&["item", "show", &id])
+        .contains("Turn cut short (wall-clock budget exceeded)"));
+
+    // A second time asks a human.
+    let out = c.run_agent("fake", "hang");
+    assert!(out.status.success());
     let item = c.json(&["item", "show", &id]);
     assert_eq!(item["status"], "needs_human");
     assert!(item["waiting_on"].as_str().unwrap().contains("wall-clock"));

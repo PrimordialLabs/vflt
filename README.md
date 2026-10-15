@@ -180,6 +180,7 @@ daily_usd  = 20.0        # optional per-agent daily spend cap
 mode     = "item"        # item | shared | worktree
 dir      = "."           # for shared and worktree, relative to the collective root
 add_dirs = []
+turn_tmp = ["TMPDIR"]    # env vars set to a dir private to the turn, removed when it ends
 
 [hooks]
 gate   = ["scripts/check-disk"]   # must pass before the agent claims anything

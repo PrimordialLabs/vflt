@@ -163,6 +163,11 @@ pub struct Workspace {
     /// More directories the runner may touch, resolved the same way.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub add_dirs: Vec<String>,
+    /// Environment variables pointed at a directory private to the turn and
+    /// removed when the turn ends (e.g. `["TMPDIR"]`). A tool killed mid-turn
+    /// never removes its temporary files; the turn's end removes them for it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub turn_tmp: Vec<String>,
 }
 
 /// Commands run around the agent's work. Each is a command template split
