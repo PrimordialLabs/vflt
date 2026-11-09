@@ -208,10 +208,17 @@ pub fn apply(
             }
             holder_check(&id, claim, by)?;
             let resting = resting_assignee(st, claim);
-            st.origin = Some(Origin {
-                stage: st.stage.clone(),
-                assignee: resting,
-            });
+            // Handing an item to whoever already holds it, at the same stage,
+            // is a re-queue, not a hand-over: the origin stays, so a later
+            // bounce still returns it to whoever sent it here.
+            let requeue = resting.as_ref() == Some(&target)
+                && stage.as_ref().map_or(true, |s| s == &st.stage);
+            if !requeue {
+                st.origin = Some(Origin {
+                    stage: st.stage.clone(),
+                    assignee: resting,
+                });
+            }
             // A draft handed on stays a draft: routing never releases it.
             if from != Status::Draft {
                 st.status = Status::Pending;
@@ -473,6 +480,47 @@ mod tests {
         .unwrap();
         assert_eq!(t.stage.as_str(), "code");
         assert!(t.assignee.is_none());
+    }
+
+    #[test]
+    fn a_self_requeue_keeps_the_origin_for_a_later_bounce() {
+        let coll = Collective::new("t");
+        let mut s = st("work", Status::InProgress);
+        s.assignee = Some(ActorId::from("tester"));
+        s.origin = origin_for_new(
+            &s.stage,
+            &ActorId::from("lead"),
+            Some(&ActorId::from("tester")),
+        );
+        let tester = ActorId::from("tester");
+        apply(
+            &coll,
+            &mut s,
+            None,
+            &tester,
+            Transition::Handoff {
+                to: tester.clone(),
+                stage: None,
+            },
+            Utc::now(),
+        )
+        .unwrap();
+        assert_eq!(s.status, Status::Pending);
+        s.status = Status::InProgress;
+        apply(
+            &coll,
+            &mut s,
+            None,
+            &tester,
+            Transition::Complete {
+                bounce: true,
+                to_stage: None,
+                note: None,
+            },
+            Utc::now(),
+        )
+        .unwrap();
+        assert_eq!(s.assignee.as_ref().unwrap().as_str(), "lead");
     }
 
     #[test]
