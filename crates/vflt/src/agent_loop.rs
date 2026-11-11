@@ -43,16 +43,55 @@ pub struct RunOptions {
 
 /// A fleet-wide cap on turns running at once. An agent takes a slot after
 /// its gates pass and before it claims anything, and holds it for the turn.
+///
+/// A free slot goes to the agent whose work is most urgent, not to whoever
+/// asks first: an agent that has just finished a turn asks again at once,
+/// while the others ask every few seconds, so first-come would let the agents
+/// already running keep every slot for as long as they have work. Each asker
+/// is ranked by the best priority among the items it is ready to run (lower
+/// runs first); every full minute it has waited counts as one priority point,
+/// so low-priority work is delayed and never starved; ties go to whoever has
+/// waited longest.
 pub struct TurnSlots {
     cap: usize,
-    used: std::sync::Mutex<usize>,
+    state: std::sync::Mutex<SlotState>,
+}
+
+#[derive(Default)]
+struct SlotState {
+    used: usize,
+    waiting: Vec<Waiter>,
+}
+
+struct Waiter {
+    who: String,
+    priority: i32,
+    /// When it first asked and was refused.
+    since: Instant,
+    /// When it last asked: an agent that stops asking drops out of the line.
+    seen: Instant,
+}
+
+/// A waiter that has not asked again for this long has gone (paused, gated,
+/// stopped, or out of work). Waiting agents ask at least every five seconds.
+const WAITER_GONE: Duration = Duration::from_secs(30);
+/// How long a wait counts as one priority point.
+const WAIT_PER_POINT: Duration = Duration::from_secs(60);
+/// The priority a cycle turn (no claimable item) asks with.
+pub const CYCLE_TURN_PRIORITY: i32 = 100;
+
+impl Waiter {
+    fn rank(&self, now: Instant) -> (i64, Instant) {
+        let waited = now.saturating_duration_since(self.since).as_secs() / WAIT_PER_POINT.as_secs();
+        (i64::from(self.priority) - waited as i64, self.since)
+    }
 }
 
 impl TurnSlots {
     pub fn new(cap: usize) -> Arc<Self> {
         Arc::new(TurnSlots {
             cap: cap.max(1),
-            used: std::sync::Mutex::new(0),
+            state: std::sync::Mutex::new(SlotState::default()),
         })
     }
 
@@ -60,13 +99,49 @@ impl TurnSlots {
         self.cap
     }
 
-    /// A slot if one is free; it is given back when the guard drops.
-    pub fn try_take(self: &Arc<Self>) -> Option<SlotGuard> {
-        let mut used = self.used.lock().unwrap_or_else(|e| e.into_inner());
-        if *used >= self.cap {
+    /// A slot, if one is free and nobody with more urgent work (or the same
+    /// urgency and a longer wait) is in line for it. `priority` is the best
+    /// priority among the work `who` would run. The slot is given back when
+    /// the guard drops. A refused asker keeps its place by asking again.
+    pub fn try_take(self: &Arc<Self>, who: &str, priority: i32) -> Option<SlotGuard> {
+        self.try_take_at(who, priority, Instant::now())
+    }
+
+    fn try_take_at(self: &Arc<Self>, who: &str, priority: i32, now: Instant) -> Option<SlotGuard> {
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        st.waiting
+            .retain(|w| w.who == who || now.saturating_duration_since(w.seen) < WAITER_GONE);
+        match st.waiting.iter_mut().find(|w| w.who == who) {
+            Some(w) => {
+                w.priority = priority;
+                w.seen = now;
+            }
+            None => st.waiting.push(Waiter {
+                who: who.to_string(),
+                priority,
+                since: now,
+                seen: now,
+            }),
+        }
+        let free = self.cap.saturating_sub(st.used);
+        if free == 0 {
             return None;
         }
-        *used += 1;
+        let mine = st
+            .waiting
+            .iter()
+            .find(|w| w.who == who)
+            .map(|w| w.rank(now))?;
+        let ahead = st
+            .waiting
+            .iter()
+            .filter(|w| w.who != who && w.rank(now) < mine)
+            .count();
+        if ahead >= free {
+            return None;
+        }
+        st.waiting.retain(|w| w.who != who);
+        st.used += 1;
         Some(SlotGuard(Arc::clone(self)))
     }
 }
@@ -75,8 +150,8 @@ pub struct SlotGuard(Arc<TurnSlots>);
 
 impl Drop for SlotGuard {
     fn drop(&mut self) {
-        let mut used = self.0.used.lock().unwrap_or_else(|e| e.into_inner());
-        *used = used.saturating_sub(1);
+        let mut st = self.0.state.lock().unwrap_or_else(|e| e.into_inner());
+        st.used = st.used.saturating_sub(1);
     }
 }
 
@@ -523,7 +598,14 @@ fn iteration(a: &Agentry, agent: &Agent, profile: &Profile) -> Result<Pass> {
     }
     let _slot = match &a.opts.slots {
         None => None,
-        Some(slots) => match slots.try_take() {
+        Some(slots) => match slots.try_take(
+            a.me.as_str(),
+            batch
+                .iter()
+                .map(|i| i.priority)
+                .min()
+                .unwrap_or(CYCLE_TURN_PRIORITY),
+        ) {
             Some(guard) => Some(guard),
             None => {
                 let what = if batch.is_empty() {
@@ -1291,6 +1373,112 @@ fn cycle_turn(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_free_slot_goes_to_the_longest_waiter_not_to_the_agent_that_just_finished() {
+        let slots = TurnSlots::new(1);
+        let t0 = Instant::now();
+        let held = slots.try_take_at("busy", 50, t0).expect("first asker runs");
+        assert!(slots
+            .try_take_at("patient", 50, t0 + Duration::from_secs(1))
+            .is_none());
+        drop(held);
+        // The agent that just finished asks again at once, same priority.
+        assert!(slots
+            .try_take_at("busy", 50, t0 + Duration::from_secs(2))
+            .is_none());
+        assert!(slots
+            .try_take_at("patient", 50, t0 + Duration::from_secs(3))
+            .is_some());
+    }
+
+    #[test]
+    fn a_free_slot_goes_to_the_most_urgent_work_first() {
+        let slots = TurnSlots::new(1);
+        let t0 = Instant::now();
+        let held = slots.try_take_at("busy", 50, t0).unwrap();
+        assert!(slots
+            .try_take_at("routine", 50, t0 + Duration::from_secs(1))
+            .is_none());
+        assert!(slots
+            .try_take_at("urgent", 5, t0 + Duration::from_secs(2))
+            .is_none());
+        drop(held);
+        assert!(slots
+            .try_take_at("routine", 50, t0 + Duration::from_secs(3))
+            .is_none());
+        let urgent = slots.try_take_at("urgent", 5, t0 + Duration::from_secs(4));
+        assert!(urgent.is_some());
+        drop(urgent);
+        assert!(slots
+            .try_take_at("routine", 50, t0 + Duration::from_secs(5))
+            .is_some());
+    }
+
+    #[test]
+    fn waiting_raises_urgency_so_low_priority_work_is_not_starved() {
+        let slots = TurnSlots::new(1);
+        let t0 = Instant::now();
+        let mut held = slots.try_take_at("busy", 40, t0);
+        assert!(held.is_some());
+        assert!(slots.try_take_at("low", 50, t0).is_none());
+        // "busy" always has priority-40 work and asks again the moment it
+        // finishes; "low" asks every five seconds. Ten points behind, "low"
+        // must get the slot once it has waited ten minutes, and not before.
+        let mut got_at = None;
+        for s in (5..=15 * 60).step_by(5) {
+            let now = t0 + Duration::from_secs(s);
+            drop(held.take()); // the turn ends, and "busy" asks first
+            held = slots.try_take_at("busy", 40, now);
+            if let Some(g) = slots.try_take_at("low", 50, now) {
+                assert!(held.is_none(), "one slot, two holders");
+                drop(g);
+                got_at = Some(s);
+                break;
+            }
+            assert!(held.is_some(), "a free slot nobody took");
+        }
+        let got_at = got_at.expect("low-priority work ran");
+        assert!((10 * 60..=11 * 60).contains(&got_at), "ran after {got_at}s");
+    }
+
+    #[test]
+    fn an_agent_that_stops_asking_leaves_the_line() {
+        let slots = TurnSlots::new(1);
+        let t0 = Instant::now();
+        let held = slots.try_take_at("busy", 50, t0).unwrap();
+        assert!(slots.try_take_at("gone", 1, t0).is_none());
+        drop(held);
+        // "gone" never asks again; within the grace period it still holds the line.
+        assert!(slots
+            .try_take_at("busy", 50, t0 + Duration::from_secs(5))
+            .is_none());
+        assert!(slots
+            .try_take_at("busy", 50, t0 + Duration::from_secs(31))
+            .is_some());
+    }
+
+    #[test]
+    fn two_free_slots_serve_the_two_best_askers() {
+        let slots = TurnSlots::new(2);
+        let t0 = Instant::now();
+        let a = slots.try_take_at("a", 50, t0).unwrap();
+        let b = slots.try_take_at("b", 50, t0).unwrap();
+        assert!(slots.try_take_at("c", 10, t0).is_none());
+        assert!(slots.try_take_at("d", 20, t0).is_none());
+        assert!(slots.try_take_at("e", 30, t0).is_none());
+        drop(a);
+        drop(b);
+        assert!(slots
+            .try_take_at("e", 30, t0 + Duration::from_secs(1))
+            .is_none());
+        assert!(slots
+            .try_take_at("d", 20, t0 + Duration::from_secs(1))
+            .is_some());
+        assert!(slots
+            .try_take_at("c", 10, t0 + Duration::from_secs(1))
+            .is_some());
+    }
 
     #[test]
     fn a_turn_cut_short_by_its_circumstances_is_told_apart() {
